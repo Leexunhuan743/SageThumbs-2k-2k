@@ -180,6 +180,9 @@ pub const FORMATS: &[(&str, &str)] = &[
     ("jpe", "JPEG (JFIF)"),
     ("jpeg", "JPEG (JFIF)"),
     ("jpg", "JPEG (JFIF)"),
+    // Lepton — Dropbox's lossless JPEG recompression (0xCF 0x84 magic). Pure-Rust tier
+    // in src/decode/lepton.rs decodes it back to a bit-exact JPEG, then the image tier.
+    ("lep", "Lepton (Dropbox lossless JPEG)"),
     ("jpm", "JPEG-2000 File Format Syntax"),
     ("jps", "Stereo JPEG"),
     ("jxl", "JPEG XL (ISO/IEC 18181)"),

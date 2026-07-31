@@ -237,6 +237,16 @@ fn decode_any_with_wic_target(
             Err(e) => crate::safety::log_debug(&format!("decode tier `jxl` failed: {e}")),
         }
     }
+    // Lepton (.lep) — Dropbox's lossless JPEG recompression, pure-Rust tier (the
+    // `image` crate/WIC/magick can't read it). Decodes to a bit-exact JPEG which the
+    // `image` tier then handles. Signature-gated like jxl; a lep file that fails
+    // falls through to the tiers below (harmless).
+    if looks_like_lepton(bytes) {
+        match decode_lepton(bytes) {
+            Ok(img) => return Ok(img),
+            Err(e) => crate::safety::log_debug(&format!("decode tier `lepton` failed: {e}")),
+        }
+    }
     match decode_with_image(bytes) {
         Ok(img) => {
             // HDR float (EXR/Radiance) decodes to 32-bit linear float, which can't
@@ -318,6 +328,7 @@ fn decode_any_with_wic_target(
 
 mod color;
 mod exrscale;
+mod lepton;
 mod magick;
 pub(crate) use magick::looks_like_metafile;
 #[cfg(test)]
@@ -337,6 +348,7 @@ mod wic;
 // it did before the split (a `pub use child::*` would also trip the
 // "does not re-export anything public enough" lint on the `pub(super)` items).
 use color::*;
+use lepton::*;
 use svg::*;
 use thumb::*;
 use tiers::*;

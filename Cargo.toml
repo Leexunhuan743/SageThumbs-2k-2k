@@ -195,6 +195,12 @@ djvu-rs = { version = "0.26", default-features = false, features = ["std"] }
 # NOTE: jxl-oxide is Rust edition 2024 and needs Rust 1.85; the workspace's effective
 # MSRV is higher because of sevenz-rust2 (see `rust-version` above).
 jxl-oxide = { version = "0.12", default-features = false, features = ["image"] }
+# Lepton (.lep) — Dropbox's lossless JPEG recompression (0xCF 0x84 magic). Pure-Rust
+# Apache-2.0 port of dropbox/lepton (microsoft/lepton_jpeg_rust), #![forbid(unsafe_code)],
+# fuzzed; decodes back to a bit-exact JPEG which the `image` tier then decodes. Decode-only
+# in our tree (LTO dead-strips the encoder from the DLL); a per-call thread pool keeps no
+# threads parked in dllhost/explorer. Exact-pinned: security-sensitive decoder.
+lepton_jpeg = "=0.5.8"
 
 [features]
 # (`.cbr`/RAR is now always-on via the pure-Rust `rars` crate — no feature gate.)
