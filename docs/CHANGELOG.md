@@ -2,6 +2,35 @@
 
 All notable user-facing changes to **SageThumbs 2K**. Newest first.
 
+## 1.4.2
+
+### Fixed
+
+- **The Lepton hardening patch set grew from eleven to seventeen.** A second,
+  broader audit of the vendored decoder against the C++ reference and hostile
+  inputs found six more ways a crafted `.lep` could abort the shell: a u8
+  underflow in the progressive write-back scan (release: index-out-of-bounds
+  in ALL builds), a missing 4-color (CMYK) gate that hit a RowSpec assert,
+  thread ranges that split between MCU rows (capacity assert), an unvalidated
+  overhang-bit count (underflow into a bit-writer assert), an unbounded
+  decompressed header (deflate bomb across many markers), and the
+  merge-contiguity assert reachable from hostile early-EOF truncation. All six
+  now fail cleanly, and the whole header stream is budgeted like every other
+  length field. The full 17-patch list lives in
+  `vendor/lepton_jpeg/SAGETHUMBS-PATCH.md`.
+- **`.lep` metadata probing no longer slurps the file.** The Details-pane
+  dimensions/EXIF probes used to read up to 256 MiB per `.lep` file (twice)
+  inside Explorer; they now read only the container's compressed header, and
+  the Image-info dialog shows `.lep` EXIF (camera make/model, capture time)
+  like any JPEG.
+- **Strip now tells you when nothing was applicable.** Selecting only
+  non-JPEG/PNG files (e.g. `.lep`) and choosing "Strip metadata" used to do
+  nothing with zero feedback; a message now explains the format gate.
+- **Oversized `.lep` files fail OCR fast.** A huge-but-valid container used to
+  be decoded in full (~1 GB of pixels) before the OCR engine rejected it; the
+  header probe now rejects it up front with the proper "image too large"
+  error.
+
 ## 1.4.1
 
 ### Added
