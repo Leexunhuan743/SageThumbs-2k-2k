@@ -55,9 +55,10 @@ pub(super) fn decode_lepton(bytes: &[u8]) -> Result<DynamicImage> {
         crate::safety::log_debug(&format!("lepton decode error: {e:?}"));
         Error::from(E_FAIL)
     })?;
-    // The same entry the jxl / raw-preview tiers end at: image crate + MAX_DIM /
-    // MAX_ALLOC limits + CMYK handling + ICC→sRGB. `jpeg` is ≤ 128 MiB by the cap
-    // above, so the allocation is bounded before this call.
+    // The same guard set as the jxl / raw-preview tiers: image crate + MAX_DIM /
+    // MAX_ALLOC limits + CMYK handling + ICC→sRGB (jxl decodes via jxl_oxide
+    // with an equivalent limits block, not through this entry). `jpeg` is
+    // ≤ 128 MiB by the cap above, so the allocation is bounded before this call.
     super::decode_with_image(&jpeg)
 }
 
@@ -165,6 +166,14 @@ mod tests {
     /// The fixed 28-byte prefix declares a modest jpeg_file_size and the exact
     /// compressed header length, so the decoder reaches the header parser.
     fn hostile_lep(header_payload: &[u8]) -> Vec<u8> {
+        hostile_lep_full(header_payload, 64)
+    }
+
+    /// Like [`hostile_lep`] with a caller-chosen `jpeg_file_size`: the
+    /// early-eof / garbage arithmetic only underflows when the declared size is
+    /// smaller than header + garbage, so tests targeting those patches choose
+    /// the size; header-validation tests keep the modest default.
+    fn hostile_lep_full(header_payload: &[u8], jpeg_file_size: u32) -> Vec<u8> {
         use std::io::Write;
         let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(header_payload).unwrap();
@@ -172,8 +181,16 @@ mod tests {
 
         let mut lep = Vec::new();
         lep.extend_from_slice(&[0xCF, 0x84, 0x01, b'Z', 0, 0, 0, 0]);
-        lep.extend_from_slice(&[0; 12]); // git-revision / flags area
-        lep.extend_from_slice(&64u32.to_le_bytes()); // jpeg_file_size
+        // Mirror the Rust encoder's fixed-header layout (lepton_header.rs:460-477):
+        // "MS" magic + u32 legacy header size + flags + encoder_version (NOT 55,
+        // or bad_truncation_version() skips the garbage-size arithmetic) + 4-byte
+        // git prefix.
+        lep.extend_from_slice(b"MS");
+        lep.extend_from_slice(&0u32.to_le_bytes()); // legacy uncompressed header size
+        lep.push(0x80); // flags
+        lep.push(1); // encoder_version — != 55 so the patch-8 path runs
+        lep.extend_from_slice(&[0; 4]); // git revision prefix
+        lep.extend_from_slice(&jpeg_file_size.to_le_bytes());
         lep.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         lep.extend_from_slice(&compressed);
         // The decoder also wants a CMP marker + trailing 4-byte EOF size before
@@ -182,6 +199,73 @@ mod tests {
         lep.extend_from_slice(b"CMP");
         lep.extend_from_slice(&(lep.len() as u32 + 4).to_le_bytes());
         lep
+    }
+
+    /// "HDR" marker + u32 raw-header length + `raw` + `markers` — the payload
+    /// shape for [`hostile_lep`] / [`hostile_lep_full`]. The markers (HH/EEE/
+    /// GRB/…) live OUTSIDE the declared raw-header length, exactly where the
+    /// decoder's marker loop reads them.
+    fn hdr_payload(raw: &[u8], markers: &[u8]) -> Vec<u8> {
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(raw);
+        hdr.extend_from_slice(markers);
+        hdr
+    }
+
+    /// The raw JPEG header (SOF..SOS, no SOI — the parser rejects SOI in-stream)
+    /// and the trailing recovery markers (HH splits) of a REAL in-memory .lep,
+    /// so hostile-header tests pass the scan gate by construction and keep
+    /// decode-faithful partitions.
+    fn real_header_parts() -> (Vec<u8>, Vec<u8>) {
+        use std::io::Read;
+        let base = lepton_bytes(&test_jpeg(96, 64));
+        let csz = u32::from_le_bytes(base[24..28].try_into().unwrap()) as usize;
+        let mut dec = flate2::read::ZlibDecoder::new(&base[28..28 + csz]);
+        let mut inflated = Vec::new();
+        dec.read_to_end(&mut inflated).unwrap();
+        let raw_len = u32::from_le_bytes(inflated[3..7].try_into().unwrap()) as usize;
+        let split = 7 + raw_len;
+        (inflated[7..split].to_vec(), inflated[split..].to_vec())
+    }
+
+    /// A one-thread HH (luma-split) marker: start u16, segment_size u32,
+    /// overhang u8, num_bits u8, 3x last_dc i16, 1x padding u16.
+    fn hh_marker(luma_y_start: u16, segment_size: u32) -> Vec<u8> {
+        let mut hh = b"HH".to_vec();
+        hh.push(1); // one thread
+        hh.extend_from_slice(&luma_y_start.to_le_bytes());
+        hh.extend_from_slice(&segment_size.to_le_bytes());
+        hh.push(0); // overhang_byte
+        hh.push(0); // num_overhang_bits
+        for _ in 0..3 {
+            hh.extend_from_slice(&0i16.to_le_bytes()); // last_dc
+        }
+        hh.extend_from_slice(&0u16.to_le_bytes()); // padding
+        hh
+    }
+
+    /// EEE (early-eof) marker: max_cmp, max_bpos, max_sah, then max_dpos[0..4].
+    /// All fields are hostile-controlled u32s; only max_sah gets a u8 range
+    /// check on read.
+    fn eee_marker(max_dpos0: u32) -> Vec<u8> {
+        let mut eee = b"EEE".to_vec();
+        eee.extend_from_slice(&0u32.to_le_bytes()); // max_cmp
+        eee.extend_from_slice(&0u32.to_le_bytes()); // max_bpos
+        eee.extend_from_slice(&0u32.to_le_bytes()); // max_sah
+        eee.extend_from_slice(&max_dpos0.to_le_bytes());
+        eee.extend_from_slice(&0u32.to_le_bytes());
+        eee.extend_from_slice(&0u32.to_le_bytes());
+        eee.extend_from_slice(&0u32.to_le_bytes());
+        eee
+    }
+
+    /// GRB (garbage) marker: u32 size + that many bytes of junk.
+    fn grb_marker(size: u32, junk: u8) -> Vec<u8> {
+        let mut grb = b"GRB".to_vec();
+        grb.extend_from_slice(&size.to_le_bytes());
+        grb.extend(std::iter::repeat_n(junk, size as usize));
+        grb
     }
 
     /// P0 regression: a JPEG header that ends at EOI before any SOF/SOS (e.g. a
@@ -200,15 +284,22 @@ mod tests {
         // Same with a real SOF0 (so cmpc >= 1) but NO SOS: the old code reached
         // the huffman recode with huff_dc/huff_ac still 0xff and indexed
         // h_codes[0][255].
+        // SOF0 present but NO SOS — the sibling of hdr1: with cmpc >= 1 the old
+        // code survived the trunc_info index and reached huffman recode with the
+        // tables still at their 0xff defaults (h_codes[0][255] OOB in ALL
+        // builds). The lepton raw header has no SOI (the parser rejects it
+        // in-stream), so a well-formed SOF0 (len 11 = 1 component) + bare EOI.
+        // The declared length must equal the payload or the probe dies in
+        // read_exact before the parser ever runs.
         let mut hdr2 = b"HDR".to_vec();
-        hdr2.extend_from_slice(&18u32.to_le_bytes());
+        hdr2.extend_from_slice(&15u32.to_le_bytes());
         hdr2.extend_from_slice(&[
-            0xFF, 0xD8, // SOI
-            0xFF, 0xC0, 0x00, 0x11, 0x08, // SOF0, len 17, precision 8
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, // SOF0, len 11, precision 8
             0x00, 0x40, 0x00, 0x40, // 64x64
             0x01, 0x01, 0x11, 0x00, // 1 component, 1x1 sampling, qt 0
             0xFF, 0xD9, // EOI without any SOS
         ]);
+        hdr2.extend_from_slice(&hh_marker(0, 0)); // one thread — the old huffman path
         assert!(decode_lepton(&hostile_lep(&hdr2)).is_err());
 
         // The nastiest variant: bare EOI header PLUS a one-thread HH (luma-split)
@@ -221,22 +312,101 @@ mod tests {
         let mut hdr3 = b"HDR".to_vec();
         hdr3.extend_from_slice(&2u32.to_le_bytes()); // raw header = just FF D9
         hdr3.extend_from_slice(&[0xFF, 0xD9]); // EOI, no SOF
-        hdr3.extend_from_slice(b"HH");
-        hdr3.push(1); // one thread
-        hdr3.extend_from_slice(&0u16.to_le_bytes()); // luma_y_start
-        hdr3.extend_from_slice(&0u32.to_le_bytes()); // segment_size
-        hdr3.push(0); // overhang_byte
-        hdr3.push(0); // num_overhang_bits
-        for _ in 0..3 {
-            hdr3.extend_from_slice(&0i16.to_le_bytes()); // last_dc
-        }
-        hdr3.extend_from_slice(&0u16.to_le_bytes()); // padding
+        hdr3.extend_from_slice(&hh_marker(0, 0));
         assert!(decode_lepton(&hostile_lep(&hdr3)).is_err());
+    }
+
+    /// P0 regression for patch 10 (EEE `max_dpos + 1` overflow): the EEE
+    /// marker's max_dpos fields are hostile u32s with no validation, and
+    /// `u32::MAX` used to overflow in `set_truncation_bounds` (reproduced:
+    /// "attempt to add with overflow" at truncate_components.rs:69 in
+    /// overflow-checked builds). The saturating fix makes `u32::MAX` mean "no
+    /// truncation", so a real file carrying the hostile marker must decode
+    /// normally. jpeg_file_size must exceed header + garbage + SOI so the
+    /// early-eof size arithmetic (patch 1) cannot clamp the image first.
+    #[test]
+    fn lepton_eee_maxdpos_saturates() {
+        let (raw, markers) = real_header_parts();
+        let payload = hdr_payload(&raw, &[&eee_marker(u32::MAX)[..], &markers[..]].concat());
+        let img = decode_lepton(&hostile_lep_full(&payload, 100_000))
+            .expect("EEE max_dpos=u32::MAX must saturate to no-truncation, not panic");
+        assert_eq!((img.width(), img.height()), (96, 64));
+    }
+
+    /// Regression for patch 1 (early_eof size arithmetic): a declared
+    /// jpeg_file_size smaller than garbage + raw header + SOI used to underflow
+    /// and panic in overflow-checked builds (legacy C++ files, e.g.
+    /// gold-legacy.lep). Saturating clamps to 0, the last segment shortens to
+    /// nothing, and the decode fails cleanly.
+    #[test]
+    fn lepton_early_eof_size_arithmetic_is_bounded() {
+        let (raw, markers) = real_header_parts();
+        let payload = hdr_payload(&raw, &[&eee_marker(0)[..], &markers[..]].concat());
+        // 64 < real header (~110 bytes) + EOI garbage (2) + SOI (2): underflows
+        // without the patch; clamps to an empty decode with it.
+        assert!(decode_lepton(&hostile_lep_full(&payload, 64)).is_err());
+    }
+
+    /// Regression for patch 8 (jpeg_file_size_left): a declared file size
+    /// smaller than the GRB garbage blob underflowed u64. Saturating bounds the
+    /// output writer to zero bytes, so the reconstructed JPEG is empty and the
+    /// tier fails cleanly.
+    #[test]
+    fn lepton_garbage_size_underflow_is_bounded() {
+        let (raw, markers) = real_header_parts();
+        // The real encoder's marker section ends with its own GRB (the EOI as
+        // garbage, size 2) — the LAST GRB in the stream wins, so the hostile
+        // 70-byte GRB must come AFTER the real markers or it is overwritten.
+        let payload = hdr_payload(&raw, &[&markers[..], &grb_marker(70, 0xAB)[..]].concat());
+        assert!(decode_lepton(&hostile_lep_full(&payload, 64)).is_err());
+    }
+
+    /// Regression for patch 4 (thread-range validation): hostile HH markers
+    /// with an out-of-range start or an inverted range used to reach
+    /// BlockBasedImage::merge's contiguity assert (a panic in ALL builds on the
+    /// main thread for progressive files). Both shapes must now be a clean
+    /// error before any decode work.
+    #[test]
+    fn lepton_thread_ranges_are_validated() {
+        let (raw, _) = real_header_parts();
+        // Start beyond the image height (96): inverted by construction.
+        assert!(decode_lepton(&hostile_lep(&hdr_payload(&raw, &hh_marker(200, 0)))).is_err());
+        // Contiguous at first, then a third handoff starting BELOW its
+        // predecessor's start: inverted ranges.
+        let inverted = [
+            &hh_marker(0, 0)[..],
+            &hh_marker(60, 0)[..],
+            &hh_marker(30, 0)[..],
+        ]
+        .concat();
+        assert!(decode_lepton(&hostile_lep(&hdr_payload(&raw, &inverted))).is_err());
+    }
+
+    /// Regression for patch 5 (capped header length fields): the HDR, FRS, and
+    /// GRB length fields are hostile u32s that used to drive unbounded
+    /// Vec::resize (a ~4 GiB OOM abort from a ~40-byte file). All three must
+    /// fail fast as BadLeptonFile.
+    #[test]
+    fn lepton_header_lengths_are_capped() {
+        let (raw, _) = real_header_parts();
+        // HDR raw-header length = u32::MAX.
+        let mut huge_hdr = b"HDR".to_vec();
+        huge_hdr.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_lepton(&hostile_lep(&huge_hdr)).is_err());
+        // FRS restart-error count = u32::MAX.
+        let mut frs = b"FRS".to_vec();
+        frs.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_lepton(&hostile_lep(&hdr_payload(&raw, &frs))).is_err());
+        // GRB garbage size = u32::MAX.
+        assert!(decode_lepton(&hostile_lep(&hdr_payload(&raw, &grb_marker(u32::MAX, 0)))).is_err());
     }
 
     /// Lightweight mutation fuzz: the vendored decode path must never panic on
     /// any corrupted input (bit flips + truncations of a real file), only return
-    /// Ok/Err. Guards every current and future panic site in the crate.
+    /// Ok/Err. Guards every current and future panic site in the crate. Random
+    /// flips cannot construct the structured markers (HH/EEE/CRS/GRB + exact
+    /// lengths) the per-patch regressions need — those live in the dedicated
+    /// tests above; this one patrols everything else.
     #[test]
     fn lepton_mutations_never_panic() {
         let lep = lepton_bytes(&test_jpeg(96, 64));
@@ -260,11 +430,12 @@ mod tests {
             let cut = (next() as usize) % lep.len();
             let _ = decode_lepton(&lep[..cut]); // must not panic
         }
-        // Oversized declared lengths (the P0 OOM caps): a tiny file declaring a
-        // 4 GiB garbage blob / header must Err fast, not abort.
+        // Oversized declared jpeg_file_size (bytes 20..24): trips the upstream
+        // fixed-header cap before any allocation. The HDR/FRS/GRB length caps
+        // (patch 5) are exercised deterministically by
+        // `lepton_header_lengths_are_capped`.
         let mut big = lep.clone();
         if big.len() > 28 {
-            // patch jpeg_file_size (bytes 20..24) to u32::MAX
             big[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
         }
         assert!(decode_lepton(&big).is_err());
@@ -317,9 +488,17 @@ mod tests {
                         img.width(),
                         img.height()
                     );
-                    println!("{}: OK {}x{}", path.file_name().unwrap().to_string_lossy(), img.width(), img.height());
+                    println!(
+                        "{}: OK {}x{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        img.width(),
+                        img.height()
+                    );
                 }
-                Err(_) => println!("{}: clean error (unsupported)", path.file_name().unwrap().to_string_lossy()),
+                Err(_) => println!(
+                    "{}: clean error (unsupported)",
+                    path.file_name().unwrap().to_string_lossy()
+                ),
             }
         }
     }
@@ -382,7 +561,10 @@ mod tests {
             }
             checked += 1;
         }
-        assert!(checked > 0, "no corpus jpg could be encoded — corpus empty?");
+        assert!(
+            checked > 0,
+            "no corpus jpg could be encoded — corpus empty?"
+        );
         println!(
             "roundtripped {checked} corpus jpgs; skipped {}: {skipped:?}",
             skipped.len()
@@ -397,17 +579,22 @@ mod tests {
     fn progressive_roundtrip() {
         let Some(dir) = cpp_corpus_dir() else { return };
         let mut tested = 0;
-        for name in ["iphoneprogressive", "iphoneprogressive2", "androidprogressive"] {
+        for name in [
+            "iphoneprogressive",
+            "iphoneprogressive2",
+            "androidprogressive",
+        ] {
             let path = dir.join(format!("{name}.jpg"));
-            let Ok(jpg) = std::fs::read(&path) else { continue };
+            let Ok(jpg) = std::fs::read(&path) else {
+                continue;
+            };
             // Genuine progressive marker SOF2 = FF C2 (candidate names lie).
             if !jpg.windows(2).any(|w| w == [0xFF, 0xC2]) {
                 continue;
             }
             let lep = lepton_bytes(&jpg);
-            let img = decode_lepton(&lep).unwrap_or_else(|e| {
-                panic!("{name}: progressive roundtrip decode failed: {e:?}")
-            });
+            let img = decode_lepton(&lep)
+                .unwrap_or_else(|e| panic!("{name}: progressive roundtrip decode failed: {e:?}"));
             let reference = super::super::decode_with_image(&jpg).unwrap();
             assert_eq!(
                 (img.width(), img.height()),
@@ -420,7 +607,11 @@ mod tests {
                 "{name}: pixels mismatch"
             );
             tested += 1;
-            println!("{name}.jpg: progressive roundtrip OK {}x{}", img.width(), img.height());
+            println!(
+                "{name}.jpg: progressive roundtrip OK {}x{}",
+                img.width(),
+                img.height()
+            );
         }
         assert!(tested >= 1, "no genuine progressive jpg found in corpus");
     }

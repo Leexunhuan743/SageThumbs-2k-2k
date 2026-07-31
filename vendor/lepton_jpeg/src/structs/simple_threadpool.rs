@@ -274,6 +274,15 @@ fn pool_drop_releases_idle_list() {
 
     drop(pool);
 
+    // The parking worker pushes its Sender, then drops its upgraded Arc; between
+    // those two instructions the pool's strong count is still 1, so a single
+    // immediate assert could spuriously fail when the worker is descheduled in
+    // that window. Spin until the worker releases the Arc (bounded by the 250 ms
+    // liveness probe; 5 s deadline guards a pathological scheduler).
+    let release_deadline = Instant::now() + Duration::from_secs(5);
+    while weak.upgrade().is_some() && Instant::now() < release_deadline {
+        thread::yield_now();
+    }
     assert!(
         weak.upgrade().is_none(),
         "dropping the pool must release the idle list (so worker channels close and workers exit)"

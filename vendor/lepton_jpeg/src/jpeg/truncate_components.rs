@@ -66,7 +66,14 @@ impl TruncateComponents {
             TruncateComponents::set_block_count_d_pos(
                 &mut self.trunc_info[i],
                 &jpeg_header.cmp_info[i],
-                max_d_pos[i] + 1,
+                // SAGETHUMBS PATCH (0.5.8): `max_d_pos[i]` is a hostile-controlled
+                // u32 straight from the EEE marker (lepton_header.rs marker loop,
+                // no validation — only max_sah gets a u8::try_from). Upstream
+                // `+ 1` overflowed u32::MAX and PANICKED in overflow-checked
+                // builds (dev/tests) on the header-parse main thread (no
+                // catch_unwind). Saturating: u32::MAX means "no truncation",
+                // which is exactly what the value represents.
+                max_d_pos[i].saturating_add(1),
                 self.mcu_count_vertical,
             );
         }
