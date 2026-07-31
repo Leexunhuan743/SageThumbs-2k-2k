@@ -88,6 +88,12 @@ pub(crate) fn ext_needs_magick(ext: &str) -> bool {
 /// `ImageFormat::from_extension` is deliberately not used for output routing:
 /// it also recognizes decoder-only formats (notably DDS/PCX), which previously
 /// let a generic PNG fallback create PNG bytes under the source extension.
+///
+/// `.lep` is deliberately absent: the vendored lepton encoder is test-only
+/// (used to generate fixtures; LTO-dead in the DLL, so it never ships), no
+/// ecosystem reader exists for the format, and a write-only Convert target
+/// would add real binary size for a file nobody can open. `.lep` stays a
+/// decode-only input format by design (see docs/CHANGELOG.md 1.4.1).
 fn native_output_format(ext: &str) -> Option<ImageFormat> {
     match ext.to_ascii_lowercase().as_str() {
         "png" => Some(ImageFormat::Png),
