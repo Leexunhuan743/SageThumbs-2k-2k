@@ -234,9 +234,11 @@ pub fn strip_meta(input: &str) -> Result<String, String> {
 
 /// OCR an image to plain text on stdout.
 pub fn ocr(input: &str) -> Result<String, String> {
-    // Same shared input cap as `thumbnail`. (The buffer is MOVED onto the OCR worker
-    // thread, so it isn't held twice.)
-    let bytes = decode::read_capped(input).map_err(|e| e.to_string())?;
+    // Decode via our own tiered decoder first (see `ocr::decode_to_png`): the
+    // WinRT recognizer's BitmapDecoder only opens WIC formats, so raw .lep
+    // bytes would always fail here. Same shared input cap as `thumbnail`, and
+    // the buffer is still MOVED onto the OCR worker thread (not held twice).
+    let bytes = ocr::decode_to_png(input).map_err(|e| e.to_string())?;
     // Propagate the REAL error — "no text", "no language pack", and "decode failed" are
     // three different, actionable situations (especially for an MCP/AI caller parsing this).
     ocr::recognize_bytes(bytes).map_err(|e| {

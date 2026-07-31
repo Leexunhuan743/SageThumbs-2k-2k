@@ -4,8 +4,13 @@ All notable user-facing changes to **SageThumbs 2K**. Newest first.
 
 ## 1.4.1
 
+### Added
+
+- **Lepton files are now supported end to end.** Dropbox's lossless-JPEG format (`.lep`) now gets a real thumbnail, preview-pane and Quick-preview rendering, and the full right-click treatment — Convert, Resize, Rotate, Copy to clipboard, OCR, and metadata in the Properties sheet — with EXIF orientation honored like any other photo, and `st2k convert` accepting `.lep` as input. Decoding is by file content (Lepton magic), so the same file works however it is named.
+
 ### Fixed
 
+- **Damaged .lep files can no longer take the shell down.** A corrupted, truncated, or legacy C++-encoded Lepton file used to be able to crash the decoder: an arithmetic underflow on old files, a bare-header file that walked off its own tables, a claimed size that tried to allocate roughly 4 GB of RAM, and an inflated decompression counter that could exhaust memory. The vendored decoder now carries ten crash-safety patches and is exercised against hundreds of deterministic mutations of real files, and the worker threads it used to leave parked in Explorer are cleaned up per file now.
 - **Huge OpenEXR files now get thumbnails.** A 12K VFX render pass, the kind that lands
   hundreds of megabytes on disk with PIZ compression, used to show nothing at all: it was
   simply too big to load, so no thumbnail, no preview pane, no Quick preview. EXRs are now

@@ -160,10 +160,32 @@ fn read_info_impl(path: &str, bounded: bool) -> ImageInfo {
         // so probing a small head prefix answers a folder-of-big-PSDs Details pane
         // without the whole-file read below (Explorer runs this per file, serially,
         // right alongside the thumbnail extraction).
-        if let Some((w, h)) = head_prefix(path).and_then(|head| crate::container::real_dims(&head))
+        let head = head_prefix(path);
+        if let Some((w, h)) = head
+            .as_deref()
+            .and_then(crate::container::real_dims)
         {
             info.width = w;
             info.height = h;
+        }
+        // Lepton containers store their JPEG header zlib-compressed inside the
+        // file, so neither probe above sees the SOF. For 0xCF 0x84 files only,
+        // read the file (capped like every other decode input) and decompress
+        // just the header block: no pixel decode, every declared length capped
+        // at the tier's 128 MiB budget (hostile files → None). Covers BOTH the
+        // bounded Details-pane path (whose caller enforces the wall-clock
+        // budget) and the unbounded `read_info`, which would otherwise fall to
+        // the slow full decode below.
+        if info.width == 0
+            && info.height == 0
+            && head.as_deref().is_some_and(|h| h.starts_with(&[0xCF, 0x84]))
+        {
+            if let Ok(bytes) = crate::decode::read_capped(path) {
+                if let Some((h, w)) = crate::decode::lepton::probe_dimensions(&bytes) {
+                    info.width = w;
+                    info.height = h;
+                }
+            }
         }
     }
     if info.width == 0 && info.height == 0 && !bounded {
@@ -628,5 +650,15 @@ mod tests {
         let info = read_info_bounded(psd.to_str().unwrap());
         assert_eq!((info.width, info.height), (8765, 4321));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Explorer's Details-pane path must show .lep dimensions from the
+    /// container's compressed header (the bounded probe never falls through to
+    /// a full decode). The committed fixture's SOF0 declares 640x480.
+    #[test]
+    fn bounded_info_reads_lepton_dimensions_from_compressed_header() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lepton.lep");
+        let info = read_info_bounded(path);
+        assert_eq!((info.width, info.height), (640, 480));
     }
 }

@@ -356,6 +356,21 @@ fn strip_one(exe: Option<&Path>, p: &str) -> bool {
     }
 }
 
+/// Can `strip::strip_metadata` rewrite `path`? It is a lossless metadata carve
+/// (JPEG/PNG only — its own extension gate refuses everything else with
+/// `E_FAIL`), not a convert, so .lep and every other non-JPEG/PNG image is
+/// skipped up front with an explanatory note instead of failing every file.
+fn strip_supported(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            ["jpg", "jpeg", "jpe", "jfif", "png"]
+                .iter()
+                .any(|known| e.eq_ignore_ascii_case(known))
+        })
+}
+
 /// Does `path` have an extension we can decode? A cheap extension-only gate
 /// shared by both menu surfaces (classic `IContextMenu` + modern
 /// `IExplorerCommand`) so the verbs only appear/act on supported images.
@@ -711,7 +726,9 @@ pub fn run_action(action: VerbAction, paths: &[String]) -> ActionReport {
             // Per-image, on the batch pool. Routed per file to `st2k strip`
             // (helper-if-present), else in-process `strip::strip_metadata`; `strip_one`
             // returns the same success bool, so attempted/done/note are identical to
-            // the old sequential loop.
+            // the old sequential loop. Only JPEG/PNG can be rewritten (lossless
+            // metadata carve, not a convert) — anything else is skipped up front
+            // with a note, instead of failing every file with the writer's E_FAIL.
             let exe = st2k_exe();
             let exe_ref = exe.as_deref();
             let imgs: Vec<String> = paths
@@ -719,12 +736,26 @@ pub fn run_action(action: VerbAction, paths: &[String]) -> ActionReport {
                 .filter(|p| is_image(p.as_str()))
                 .cloned()
                 .collect();
-            let oks = crate::parallel::map(&imgs, |_, p| strip_one(exe_ref, p));
-            let attempted = imgs.len();
+            let (stripable, skipped): (Vec<String>, Vec<String>) =
+                imgs.into_iter().partition(|p| strip_supported(p));
+            let oks = crate::parallel::map(&stripable, |_, p| strip_one(exe_ref, p));
+            let attempted = stripable.len();
             let done = oks.iter().filter(|&&ok| ok).count();
             let mut r = ActionReport::applied(attempted, done);
-            if done < attempted {
-                r.note = Some("couldn't rewrite the file without metadata".into());
+            if done < attempted || !skipped.is_empty() {
+                r.note = Some(if done < attempted && skipped.is_empty() {
+                    "couldn't rewrite the file without metadata".into()
+                } else if done < attempted {
+                    format!(
+                        "couldn't rewrite some files; strip is JPEG/PNG only — {} unsupported file(s) skipped",
+                        skipped.len()
+                    )
+                } else {
+                    format!(
+                        "strip is JPEG/PNG only — {} unsupported file(s) skipped",
+                        skipped.len()
+                    )
+                });
             }
             r
         }

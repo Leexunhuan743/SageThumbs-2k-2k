@@ -9,6 +9,13 @@ use super::*;
 use lepton_jpeg::decode_lepton as lepton_decode;
 use lepton_jpeg::{EnabledFeatures, LeptonThreadPriority, SimpleThreadPool};
 
+/// Original-JPEG size budget for the lepton container (the crate's own compat
+/// default). It bounds the decoded-JPEG buffer in [`decode_lepton`] AND every
+/// length field [`probe_dimensions`] trusts — the header probe rejects files
+/// that declare more, so "plausible header" means the same thing on both
+/// paths.
+const MAX_JPEG_FILE_SIZE: u32 = 128 * 1024 * 1024;
+
 /// Lepton signature: the tau symbol `0xCF 0x84` (LEPTON_FILE_HEADER). The version
 /// byte at [2] and the 'Z'/'X' JPEG-type byte at [3] are validated by the decoder
 /// itself. The 0xCE 0xB6 zlib-outer variant and UJG ("UJ") are NOT supported by
@@ -41,7 +48,7 @@ pub(super) fn decode_lepton(bytes: &[u8]) -> Result<DynamicImage> {
         // Bounds decode parallelism; the pool below is per-call anyway.
         max_processor_threads: 2,
         // Declared original-JPEG size cap (128 MiB — the crate's compat default).
-        max_jpeg_file_size: 128 * 1024 * 1024,
+        max_jpeg_file_size: MAX_JPEG_FILE_SIZE,
         stop_reading_at_eoi: false,
     };
     // Per-call pool, NOT the crate's global DEFAULT_THREAD_POOL: a per-call pool is
@@ -76,6 +83,105 @@ pub(super) fn decode_lepton(bytes: &[u8]) -> Result<DynamicImage> {
         super::decode_with_image(&jpeg)?,
         &jpeg,
     ))
+}
+
+/// Probe ONLY the container's compressed header for the embedded JPEG's
+/// dimensions — no pixel decode, no thread pool. The property handler's
+/// [`read_info_bounded`](crate::strip::read_info_bounded) path uses this so
+/// Explorer's Details pane shows .lep dimensions without materializing the
+/// JPEG stream (propstore policy forbids full-fidelity conversion in-process);
+/// the unbounded [`read_info`](crate::strip::read_info) gets it too, skipping
+/// the slow full-decode fallback.
+///
+/// Returns `(height, width)` — the SOF marker stores height before width — or
+/// `None` on any malformation. Hostile files cannot panic: every slice index
+/// is bounds-checked, every declared length is capped at
+/// [`MAX_JPEG_FILE_SIZE`] (the same budget the decode tier applies), and the
+/// zlib stream is read through `Take` limits, so a deflate bomb stops at the
+/// declared header size.
+pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    use std::io::Read;
+
+    // Fixed header (28 bytes, offsets mirror vendor/lepton_jpeg's
+    // `read_lepton_fixed_header`): 2 magic + 1 version + 1 type byte + 12 bytes
+    // revision/flags + u32 jpeg_file_size + u32 compressed_header_size (both
+    // little-endian). The zlib-compressed header follows at offset 28.
+    const FIXED_HEADER_SIZE: usize = 28;
+    const SOI: u8 = 0xD8;
+    const SOS: u8 = 0xDA;
+    const EOI: u8 = 0xD9;
+
+    let fixed = bytes.get(..FIXED_HEADER_SIZE)?;
+    if !fixed.starts_with(&[0xCF, 0x84]) || fixed[2] != 1 || !matches!(fixed[3], b'Z' | b'X') {
+        return None;
+    }
+    let jpeg_file_size = u32::from_le_bytes(fixed[20..24].try_into().ok()?);
+    let compressed_header_size = u32::from_le_bytes(fixed[24..28].try_into().ok()?);
+    if jpeg_file_size > MAX_JPEG_FILE_SIZE || compressed_header_size > MAX_JPEG_FILE_SIZE {
+        return None;
+    }
+    let end = FIXED_HEADER_SIZE.checked_add(compressed_header_size as usize)?;
+    let compressed = bytes.get(FIXED_HEADER_SIZE..end)?;
+
+    // Decompressed layout: "HDR" + u32 LE declared raw-header length, then that
+    // many bytes of raw JPEG header (SOI..SOS, SOI excluded). Read the 7-byte
+    // prefix FIRST so the decompression budget is the DECLARED header size, not
+    // the whole (potentially bomb-shaped) stream.
+    let mut dec = flate2::read::ZlibDecoder::new(std::io::Cursor::new(compressed));
+    let mut prefix = [0u8; 7];
+    dec.read_exact(&mut prefix).ok()?;
+    if &prefix[..3] != b"HDR" {
+        return None;
+    }
+    let hdr_len = u32::from_le_bytes([prefix[3], prefix[4], prefix[5], prefix[6]]) as usize;
+    if hdr_len > MAX_JPEG_FILE_SIZE as usize {
+        return None;
+    }
+    let mut raw = Vec::new();
+    dec.take(hdr_len as u64).read_to_end(&mut raw).ok()?;
+    if raw.len() < hdr_len {
+        return None; // declared header runs past the end of the zlib stream
+    }
+
+    // Walk the JPEG segments to the first SOF0/1/2 (FF C0/C1/C2). Every index
+    // is bounds-checked; a segment whose declared length is not fully present
+    // (or is absurdly small) ends the probe with None.
+    let mut i = 0usize;
+    while i + 1 < raw.len() {
+        if raw[i] != 0xFF {
+            return None; // marker byte expected between segments
+        }
+        let marker = raw[i + 1];
+        match marker {
+            // SOI and the standalone markers (TEM, RSTn) carry no length field.
+            SOI | 0x01 | 0xD0..=0xD7 => i += 2,
+            // SOS / EOI before any SOF: no usable dimensions in this header.
+            SOS | EOI => return None,
+            _ => {
+                let seg_len =
+                    u16::from_be_bytes(raw.get(i + 2..i + 4)?.try_into().ok()?) as usize;
+                if seg_len < 2 {
+                    return None;
+                }
+                let seg_end = i.checked_add(2)?.checked_add(seg_len)?;
+                raw.get(i + 2..seg_end)?; // declared segment must be fully present
+                if matches!(marker, 0xC0..=0xC2) {
+                    // Payload: precision(1) + height u16 BE + width u16 BE +
+                    // component count(1) + components. seg_len >= 8 guarantees
+                    // the precision..width bytes below are in range.
+                    if seg_len < 8 {
+                        return None;
+                    }
+                    let payload = i + 4;
+                    let height = u32::from_be_bytes([0, 0, raw[payload + 1], raw[payload + 2]]);
+                    let width = u32::from_be_bytes([0, 0, raw[payload + 3], raw[payload + 4]]);
+                    return (height > 0 && width > 0).then_some((height, width));
+                }
+                i = seg_end;
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -792,5 +898,112 @@ mod tests {
             );
         }
         assert!(tested >= 1, "no genuine progressive jpg found in corpus");
+    }
+
+    /// The committed fixture's SOF0 declares 640x480 — the probe must extract
+    /// exactly that from the container's compressed header, height FIRST (SOF
+    /// stores height before width), without decoding a single pixel.
+    #[test]
+    fn probe_dimensions_reads_fixture_header() {
+        let lep = include_bytes!("../../tests/fixtures/lepton.lep");
+        assert!(looks_like_lepton(lep));
+        assert_eq!(probe_dimensions(lep), Some((480, 640)));
+    }
+
+    /// Segment walking: non-SOF segments (APP0) are skipped by their declared
+    /// length and the SOF that follows is still found.
+    #[test]
+    fn probe_dimensions_skips_preceding_segments() {
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&33u32.to_le_bytes());
+        hdr.extend_from_slice(&[
+            0xFF, 0xE0, 0x00, 0x12, // APP0, len 18 (2 length bytes + 16 payload)
+            b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, // 16-byte APP0 payload
+            0xFF, 0xC0, 0x00, 0x0B, // SOF0, len 11
+            0x08, // precision 8
+            0x01, 0xE0, 0x02, 0x80, // height 480, width 640
+            0x01, 0x01, 0x11, 0x00, // 1 component
+        ]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), Some((480, 640)));
+    }
+
+    /// `probe_dimensions` must never panic and must return None for every
+    /// malformed container: truncated fixed header, bogus magic, zeroed sizes,
+    /// unsupported version/type, over-budget declared lengths, non-zlib
+    /// compressed data, a missing HDR marker, over-budget/truncated raw-header
+    /// lengths, and JPEG headers without a usable SOF.
+    #[test]
+    fn probe_dimensions_rejects_hostile_headers() {
+        // Too short for the 28-byte fixed header / wrong magic.
+        assert_eq!(probe_dimensions(&[]), None);
+        assert_eq!(probe_dimensions(&[0xCF, 0x84]), None);
+        assert_eq!(probe_dimensions(&[0xCE, 0xB6, 1, 2, 3]), None);
+        // Magic + all-zero fixed header: declares nothing to decompress.
+        let mut zeroed = vec![0xCF, 0x84, 0x01, b'Z'];
+        zeroed.extend_from_slice(&[0; 24]);
+        assert_eq!(probe_dimensions(&zeroed), None);
+        // Unsupported version / type bytes.
+        let mut bad_ver = vec![0xCF, 0x84, 0x02, b'Z'];
+        bad_ver.extend_from_slice(&[0; 24]);
+        assert_eq!(probe_dimensions(&bad_ver), None);
+        let mut bad_type = vec![0xCF, 0x84, 0x01, b'Q'];
+        bad_type.extend_from_slice(&[0; 24]);
+        assert_eq!(probe_dimensions(&bad_type), None);
+        // jpeg_file_size beyond the 128 MiB budget.
+        let mut over = vec![0xCF, 0x84, 0x01, b'Z', 0, 0, 0, 0];
+        over.extend_from_slice(&[0; 12]);
+        over.extend_from_slice(&u32::MAX.to_le_bytes());
+        over.extend_from_slice(&4u32.to_le_bytes());
+        over.extend_from_slice(&[0; 4]);
+        assert_eq!(probe_dimensions(&over), None);
+        // compressed_header_size beyond the 128 MiB budget.
+        let mut huge_comp = vec![0xCF, 0x84, 0x01, b'Z', 0, 0, 0, 0];
+        huge_comp.extend_from_slice(&[0; 12]);
+        huge_comp.extend_from_slice(&64u32.to_le_bytes());
+        huge_comp.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(probe_dimensions(&huge_comp), None);
+        // Declared compressed header runs past the end of the file.
+        let mut truncated = vec![0xCF, 0x84, 0x01, b'Z', 0, 0, 0, 0];
+        truncated.extend_from_slice(&[0; 12]);
+        truncated.extend_from_slice(&64u32.to_le_bytes());
+        truncated.extend_from_slice(&100u32.to_le_bytes());
+        assert_eq!(probe_dimensions(&truncated), None);
+        // Valid zlib stream that is not a lepton header ("HDR" missing).
+        assert_eq!(probe_dimensions(&hostile_lep(b"NOPE")), None);
+        // "HDR" declaring u32::MAX raw-header bytes (over budget).
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+        // "HDR" declaring more raw bytes than the zlib stream holds.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&100u32.to_le_bytes());
+        hdr.extend_from_slice(&[0xFF, 0xC0]); // only 2 of the 100 bytes
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+        // Raw header that is just an EOI (no SOF, no SOS).
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&2u32.to_le_bytes());
+        hdr.extend_from_slice(&[0xFF, 0xD9]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+        // SOS before any SOF.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&4u32.to_le_bytes());
+        hdr.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+        // SOF declaring zero dimensions.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&13u32.to_le_bytes());
+        hdr.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, // SOF0, len 11
+            0x08, // precision 8
+            0x00, 0x00, 0x00, 0x00, // height 0, width 0
+            0x01, 0x01, 0x11, 0x00, // 1 component
+        ]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+        // SOF whose declared length runs past the end of the raw header.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&6u32.to_le_bytes());
+        hdr.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
     }
 }
