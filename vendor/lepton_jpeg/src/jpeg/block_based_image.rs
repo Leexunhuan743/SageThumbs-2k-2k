@@ -42,10 +42,10 @@ impl BlockBasedImage {
         let max_size = block_width * original_height;
 
         let image_capacity = usize::try_from(
-            // SAGETHUMBS PATCH (0.5.8): saturating — inverted luma ranges that
-            // slip past the lepton_header.rs thread-range validation underflowed
-            // u32 here (debug panic; release wrapped into a graceful OOM).
-            // Defense in depth behind the range check (patch 4).
+            // SAGETHUMBS PATCH (0.5.8): hostile thread-handoff ranges can invert
+            // luma_y_end < luma_y_start (upstream plain `-` underflowed u32 →
+            // panic in debug, huge wrap in release). Defense-in-depth behind the
+            // header range validation: saturate to 0 → clean OOM-free allocation.
             (u64::from(max_size)
                 * u64::from(luma_y_end.saturating_sub(luma_y_start))
                 + u64::from(jpeg_header.cmp_info[0].bcv - 1 /* round up */))

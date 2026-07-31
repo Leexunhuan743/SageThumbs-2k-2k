@@ -78,6 +78,20 @@ pub struct SimpleThreadPool {
     idle_threads: LazyLock<Arc<Mutex<Vec<Sender<Box<dyn FnOnce() + Send + 'static>>>>>>,
 }
 
+// SAGETHUMBS PATCH (0.5.8): test-only liveness counter. Workers increment on
+// entry and decrement on exit, so a regression test can assert that a dropped
+// per-call pool's threads actually terminate. cfg(test) only — zero impact on
+// production builds (including DEFAULT_THREAD_POOL, whose workers legitimately
+// live for the process lifetime).
+#[cfg(test)]
+static ACTIVE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// SAGETHUMBS PATCH (0.5.8): serializes the pool tests (ACTIVE_WORKERS is global,
+// and DEFAULT_THREAD_POOL's permanent workers in test_threadpool would otherwise
+// race the exit assertions).
+#[cfg(test)]
+static POOL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl SimpleThreadPool {
     /// Creates a new thread pool with the specified priority.
     pub const fn new(priority: LeptonThreadPriority) -> Self {
@@ -131,13 +145,18 @@ impl SimpleThreadPool {
             // pool's channels never close when the pool is dropped: workers park on
             // `recv()` forever and every decode leaks 1-2 threads inside dllhost/
             // explorer. With a Weak, dropping the pool drops the last strong Arc,
-            // which drops the Vec and every Sender; each worker's `recv()` then
-            // returns Err and the worker exits. The process-global
+            // which drops the Vec and every Sender clone. Each worker's own
+            // captured Sender keeps its channel open, so the worker cannot observe
+            // Disconnected — it exits via the 250 ms liveness probe below (recv
+            // timeout + failed Weak upgrade). The process-global
             // `DEFAULT_THREAD_POOL` is unaffected (it is never dropped, so its
             // Weak never expires and its workers keep being reused).
             let idle_threads = Arc::downgrade(&self.idle_threads);
 
             spawn(move || {
+                #[cfg(test)]
+                ACTIVE_WORKERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 match priority {
                     LeptonThreadPriority::Low => thread_priority::set_current_thread_priority(
@@ -194,14 +213,20 @@ impl SimpleThreadPool {
                                 // wake-up would duplicate the idle-list entry, and a
                                 // worker later evicted by the NUM_CPUS cap would
                                 // leave a stale Sender behind (send → SendError
-                                // panic on the next submit).
+                                // panic on the next submit). A failed upgrade means
+                                // the owning pool was dropped: exit via the outer
+                                // loop's upgrade check.
                                 if idle_threads.upgrade().is_none() {
-                                    return;
+                                    break;
                                 }
                             }
                         }
                     }
                 }
+                // SAGETHUMBS PATCH (0.5.8): single exit point — decrement the
+                // test-only liveness counter (cfg(test) strips this in release).
+                #[cfg(test)]
+                ACTIVE_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             });
     }
 }
@@ -226,6 +251,11 @@ fn test_threadpool() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    // SAGETHUMBS PATCH (0.5.8): serialize with the pool regression tests so
+    // DEFAULT_THREAD_POOL workers (which legitimately outlive their test) do
+    // not race the ACTIVE_WORKERS exit assertions.
+    let _lock = POOL_TEST_LOCK.lock().unwrap();
+
     let a: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
     for _i in 0usize..100 {
@@ -248,15 +278,18 @@ fn test_threadpool() {
 /// pool never releases the Vec: channels stay open and every worker parks on
 /// `recv()` forever (a thread leak per decode inside dllhost/explorer). With the
 /// Weak-reference patch the pool drop is the last Arc owner; the Vec (and every
-/// Sender) drops, each worker's `recv()` errors, and the worker exits.
+/// Sender clone) drops and each worker exits via the 250 ms liveness probe
+/// (recv timeout + failed Weak upgrade — its own captured Sender keeps the
+/// channel open, so recv never returns Disconnected).
 ///
 /// This asserts the root cause directly: after `drop(pool)` the idle list Arc
-/// must be gone (Weak upgrade fails). No global thread counting, so it cannot
-/// race with other tests that spawn pool workers.
+/// must be gone (Weak upgrade fails). Worker termination itself is asserted by
+/// per_call_pool_workers_exit_on_drop below.
 #[test]
 fn pool_drop_releases_idle_list() {
     use std::time::{Duration, Instant};
 
+    let _lock = POOL_TEST_LOCK.lock().unwrap();
     let pool = SimpleThreadPool::new(LeptonThreadPriority::Normal);
     // Direct access to the private field: this test lives in the same module.
     let weak = Arc::downgrade(&pool.idle_threads);
@@ -274,18 +307,69 @@ fn pool_drop_releases_idle_list() {
 
     drop(pool);
 
-    // The parking worker pushes its Sender, then drops its upgraded Arc; between
-    // those two instructions the pool's strong count is still 1, so a single
-    // immediate assert could spuriously fail when the worker is descheduled in
-    // that window. Spin until the worker releases the Arc (bounded by the 250 ms
-    // liveness probe; 5 s deadline guards a pathological scheduler).
-    let release_deadline = Instant::now() + Duration::from_secs(5);
-    while weak.upgrade().is_some() && Instant::now() < release_deadline {
+    // The second worker may still hold a transient upgrade from its park path;
+    // poll briefly instead of asserting immediately (spurious-flake window).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while weak.upgrade().is_some() && Instant::now() < deadline {
         thread::yield_now();
     }
     assert!(
         weak.upgrade().is_none(),
         "dropping the pool must release the idle list (so worker channels close and workers exit)"
+    );
+}
+
+/// SAGETHUMBS PATCH regression test: worker threads must actually TERMINATE
+/// after their per-call pool is dropped (bounded by the 250 ms liveness probe),
+/// not merely release the idle-list Arc. Upstream leaked 1-2 parked threads per
+/// decode inside dllhost/explorer; a regression that leaks threads via any other
+/// mechanism (detached spawn, captured Sender registry) fails this test.
+#[test]
+fn per_call_pool_workers_exit_on_drop() {
+    use std::time::{Duration, Instant};
+
+    let _lock = POOL_TEST_LOCK.lock().unwrap();
+    let before = ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst);
+    {
+        let pool = SimpleThreadPool::new(LeptonThreadPriority::Normal);
+        pool.run(Box::new(|| {}));
+        pool.run(Box::new(|| {}));
+
+        // Both workers must come alive...
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) < before + 2
+            && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert!(
+            ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) >= before + 2,
+            "two workers should be alive while the pool is alive"
+        );
+
+        // ...and both must park in the idle list before we drop the pool.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.get_idle_threads() < 2 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            pool.get_idle_threads() >= 2,
+            "both workers should have parked"
+        );
+    }
+
+    // After the pool is dropped every worker must exit within the 250 ms probe
+    // (2 s budget leaves ample slack on loaded CI machines).
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) > before
+        && Instant::now() < deadline
+    {
+        thread::yield_now();
+    }
+    assert_eq!(
+        ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "every worker spawned for this pool must exit after the pool is dropped"
     );
 }
 

@@ -344,7 +344,13 @@ impl LeptonHeader {
             ) {
                 // CRS marker
                 self.rinfo.rst_cnt_set = true;
-                let rst_count = header_reader.read_u32::<LittleEndian>()?;
+                // SAGETHUMBS PATCH (0.5.8): cap the CRS rst_count loop like the
+                // other hostile length fields above. A deflate bomb (a few MiB of
+                // compressed input, bounded only by compressed_header_size) can
+                // decompress to GiB of rst_count entries, growing rst_cnt
+                // unboundedly -> OOM abort in the shell host. Legit files carry
+                // one small entry per scan, so the cap cannot reject valid files.
+                let rst_count = cap(header_reader.read_u32::<LittleEndian>()? as usize)?;
 
                 for _i in 0..rst_count {
                     self.rinfo
