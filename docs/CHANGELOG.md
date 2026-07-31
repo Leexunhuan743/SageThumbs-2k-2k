@@ -10,7 +10,7 @@ All notable user-facing changes to **SageThumbs 2K**. Newest first.
 
 ### Fixed
 
-- **Damaged .lep files can no longer take the shell down.** A corrupted, truncated, or legacy C++-encoded Lepton file used to be able to crash the decoder: an arithmetic underflow on old files, a bare-header file that walked off its own tables, a claimed size that tried to allocate roughly 4 GB of RAM, and an inflated decompression counter that could exhaust memory. The vendored decoder now carries ten crash-safety patches and is exercised against hundreds of deterministic mutations of real files, and the worker threads it used to leave parked in Explorer are cleaned up per file now.
+- **Damaged .lep files can no longer take the shell down.** A corrupted, truncated, or legacy C++-encoded Lepton file used to be able to crash the decoder: an arithmetic underflow on old files, a bare-header file that walked off its own tables, a claimed size that tried to allocate roughly 4 GB of RAM, and an inflated decompression counter that could exhaust memory. The vendored decoder now carries eleven crash-safety patches and is exercised against hundreds of deterministic mutations of real files, and the worker threads it used to leave parked in Explorer are cleaned up per file now.
 - **Huge OpenEXR files now get thumbnails.** A 12K VFX render pass, the kind that lands
   hundreds of megabytes on disk with PIZ compression, used to show nothing at all: it was
   simply too big to load, so no thumbnail, no preview pane, no Quick preview. EXRs are now

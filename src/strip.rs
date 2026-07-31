@@ -161,10 +161,7 @@ fn read_info_impl(path: &str, bounded: bool) -> ImageInfo {
         // without the whole-file read below (Explorer runs this per file, serially,
         // right alongside the thumbnail extraction).
         let head = head_prefix(path);
-        if let Some((w, h)) = head
-            .as_deref()
-            .and_then(crate::container::real_dims)
-        {
+        if let Some((w, h)) = head.as_deref().and_then(crate::container::real_dims) {
             info.width = w;
             info.height = h;
         }
@@ -178,7 +175,9 @@ fn read_info_impl(path: &str, bounded: bool) -> ImageInfo {
         // the slow full decode below.
         if info.width == 0
             && info.height == 0
-            && head.as_deref().is_some_and(|h| h.starts_with(&[0xCF, 0x84]))
+            && head
+                .as_deref()
+                .is_some_and(|h| h.starts_with(&[0xCF, 0x84]))
         {
             if let Ok(bytes) = crate::decode::read_capped(path) {
                 if let Some((h, w)) = crate::decode::lepton::probe_dimensions(&bytes) {
