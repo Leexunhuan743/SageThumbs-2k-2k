@@ -822,8 +822,11 @@ mod tests {
 
     /// A progressive JPEG must round-trip identically through lepton. The image
     /// crate's encoder is baseline-only, so the progressive source comes from the
-    /// C++ corpus (iphoneprogressive.jpg is genuine SOF2; the similarly-named
-    /// iphoneprogressive2/androidprogressive are baseline, so probe for a real one).
+    /// C++ corpus. All three candidates contain a genuine SOF2 (FF C2) marker —
+    /// including iphoneprogressive2.jpg and androidprogressive.jpg, which an
+    /// earlier comment wrongly called baseline — so the byte probe is the only
+    /// reliable discriminator (name-based assumptions proved wrong), and
+    /// non-progressive files are skipped by it.
     #[test]
     fn progressive_roundtrip() {
         let Some(dir) = cpp_corpus_dir() else { return };
