@@ -4,6 +4,16 @@ All notable user-facing changes to **SageThumbs 2K**. Newest first.
 
 ## 1.4.2
 
+### Changed
+
+- **Quick preview: the Space key now has two mutually exclusive modes** instead of the
+  750 ms hold-guess. Settings shows a radio pair: **Toggle** (default — tap to show, tap
+  again or Esc to close) and **Hold to peek** (hold to view, ANY release closes). In Hold
+  mode the "close when the preview loses focus" option is greyed out (the release already
+  closes); hand-launched `--preview` windows keep the pre-mode focus-loss behaviour. The
+  old `PreviewHoldPeek` registry value is superseded by `PreviewSpaceMode` (0 = Toggle,
+  1 = HoldPeek).
+
 ### Fixed
 
 - **The Lepton hardening patch set grew from eleven to seventeen.** A second,

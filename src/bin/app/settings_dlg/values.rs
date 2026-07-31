@@ -44,7 +44,17 @@ pub(super) unsafe fn load_values(hwnd: HWND) {
     check(hwnd, ID_UPDATE_AUTO, settings::update_auto_check());
     // Quick preview toggles.
     check(hwnd, ID_PREVIEW_ENABLED, settings::preview_enabled());
-    check(hwnd, ID_PREVIEW_HOLD_PEEK, settings::preview_hold_peek());
+    // Space-key mode: exactly one radio is checked (mutually exclusive pair).
+    check(
+        hwnd,
+        ID_PREVIEW_MODE_TOGGLE,
+        settings::preview_space_mode() == settings::SpaceMode::Toggle,
+    );
+    check(
+        hwnd,
+        ID_PREVIEW_HOLD_PEEK,
+        settings::preview_space_mode() == settings::SpaceMode::HoldPeek,
+    );
     check(
         hwnd,
         ID_PREVIEW_CLOSE_FOCUS,
@@ -71,6 +81,8 @@ pub(super) unsafe fn load_values(hwnd: HWND) {
     );
     update_quick_enabled(hwnd);
     refresh_shot_status(hwnd);
+    // Grey close-on-focus-loss when HOLD mode is selected (radio state → option).
+    update_space_mode_enabled(hwnd);
     // Seed the Settings-sync row (button label + green "● Synced" badge) from the signed-in
     // state; the background pull (spawn_sync_pull) later refreshes it via WM_APP_SYNC.
     refresh_sync_ui(hwnd);
@@ -98,12 +110,14 @@ pub(super) unsafe fn load_defaults(hwnd: HWND) {
                                        // Quick preview: reset the behavior toggles to their defaults, but leave the master
                                        // ENABLE alone — like the screenshot service, "Defaults" shouldn't silently kill a
                                        // feature the user turned on.
-    check(hwnd, ID_PREVIEW_HOLD_PEEK, true);
+    check(hwnd, ID_PREVIEW_MODE_TOGGLE, true); // space = click to toggle (default mode)
+    check(hwnd, ID_PREVIEW_HOLD_PEEK, false);
     check(hwnd, ID_PREVIEW_CLOSE_FOCUS, false);
     check(hwnd, ID_PREVIEW_TOPMOST, true); // "Open in front" — default ON
     check(hwnd, ID_PREVIEW_TEXT, true);
     check(hwnd, ID_PREVIEW_MARKDOWN, true);
     check(hwnd, ID_PREVIEW_MD_REMOTE, false); // outbound fetch from previewed docs → default OFF
+    update_space_mode_enabled(hwnd); // default Toggle → close-on-focus-loss enabled
     #[cfg(feature = "html-preview")]
     {
         check(hwnd, ID_PREVIEW_HTML, true); // locked-down (scripts off, no network) → default ON
@@ -175,6 +189,17 @@ pub(super) unsafe fn reset_formats(hwnd: HWND) {
         for i in 0..count {
             set_check(list, i, true);
         }
+    }
+}
+
+/// Grey the "close on focus loss" option while the Space key is in HOLD mode:
+/// the release already closes the window there, so the option is meaningless.
+/// The stored value is left untouched — a manual `--preview` launch keeps its
+/// pre-mode behaviour (see window.rs WM_ACTIVATE).
+pub(super) unsafe fn update_space_mode_enabled(hwnd: HWND) {
+    let hold = checked(hwnd, ID_PREVIEW_HOLD_PEEK);
+    if let Ok(c) = GetDlgItem(Some(hwnd), ID_PREVIEW_CLOSE_FOCUS) {
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(c, !hold);
     }
 }
 
@@ -370,7 +395,15 @@ pub(super) unsafe fn apply_settings(hwnd: HWND) {
     // whenever Quick preview is enabled (via daemon_wanted) — sees the new state and
     // starts/stops the daemon + autostart entry to match.
     let _ = settings::set_preview_enabled(checked(hwnd, ID_PREVIEW_ENABLED));
-    let _ = settings::set_preview_hold_peek(checked(hwnd, ID_PREVIEW_HOLD_PEEK));
+    // Space-key mode: the radio pair is mutually exclusive, so checking the
+    // toggle radio is the whole verdict (radio semantics make both-unchecked
+    // impossible).
+    let mode = if checked(hwnd, ID_PREVIEW_MODE_TOGGLE) {
+        settings::SpaceMode::Toggle
+    } else {
+        settings::SpaceMode::HoldPeek
+    };
+    let _ = settings::set_preview_space_mode(mode);
     let _ = settings::set_preview_close_on_focus_loss(checked(hwnd, ID_PREVIEW_CLOSE_FOCUS));
     let _ = settings::set_preview_open_front(checked(hwnd, ID_PREVIEW_TOPMOST));
     let _ = settings::set_preview_text(checked(hwnd, ID_PREVIEW_TEXT));

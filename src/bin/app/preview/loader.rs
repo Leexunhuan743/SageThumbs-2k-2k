@@ -713,7 +713,7 @@ pub(super) unsafe fn client_size(hwnd: HWND) -> (i32, i32) {
     let st = &*state(hwnd);
     let sc = |v: i32| crate::win::dpi_scale(hwnd, v);
     let cap = sc(CAPTION_H);
-    match st.kind.get() {
+    let (w, h) = match st.kind.get() {
         ContentKind::Image => {
             if let Some((rdw, rdh)) = image_dims(st) {
                 let (_dpi, work) = crate::win::cursor_monitor_metrics();
@@ -736,7 +736,19 @@ pub(super) unsafe fn client_size(hwnd: HWND) -> (i32, i32) {
         ContentKind::Html => (sc(VIDEO_W), sc(VIDEO_H) + cap), // browser-ish default
 
         ContentKind::Loading => (sc(LOADING_W), sc(LOADING_H)),
-    }
+    };
+    // Clamp EVERY kind to the cursor monitor's work area with the same 80%
+    // budget the Image branch applies. Fixed-size kinds (video/text/html)
+    // used to exceed small screens / high-DPI work areas; the window then
+    // landed clamped at the work-area TOP-LEFT corner (center_on_cursor_monitor
+    // can only position, not resize) instead of centering a suitably scaled
+    // window. The caps are per-axis (the engines letterbox / reflow to the
+    // real aspect), and MIN_W/MIN_H still wins on absurdly tiny work areas so
+    // the window never collapses below its minimum.
+    let (_dpi, work) = crate::win::cursor_monitor_metrics();
+    let max_w = (work.right - work.left) * 80 / 100;
+    let max_h = (work.bottom - work.top) * 80 / 100 - cap;
+    (w.min(max_w.max(sc(MIN_W))), h.min(max_h.max(sc(MIN_H))))
 }
 
 /// Resize (and optionally move) the window so its CLIENT area is `cw`×`ch`. `pos` = top-left

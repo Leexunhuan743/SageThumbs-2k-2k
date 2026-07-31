@@ -152,6 +152,12 @@ pub(super) struct ViewerState {
     /// so the viewer owns its own Space/Esc/Enter. When the hook is the authority (Phase 2),
     /// the viewer does NOT handle those keys locally (plan §3).
     pub(super) manual: bool,
+    /// Launched with an explicit `--preview <path>` (a hand launch, not the daemon's
+    /// Space-driven spawn, which carries no path). Kept separate from `manual` so a hand
+    /// launch while the daemon hook IS enabled still counts: close-on-focus-loss keeps its
+    /// pre-mode behaviour for hand launches ("manual --preview stays as-is"), while
+    /// Space-driven windows apply it only in Toggle mode.
+    pub(super) manual_launch: bool,
     pub(super) shot: bool,
     pub(super) path: RefCell<Option<String>>,
     pub(super) kind: Cell<ContentKind>,
@@ -332,6 +338,7 @@ pub(super) unsafe fn create_viewer(
     dark: bool,
     initial_path: Option<String>,
     shot: Option<&super::ShotOpts>,
+    manual_launch: bool,
 ) -> Option<HWND> {
     ensure_class(hinst);
 
@@ -370,6 +377,7 @@ pub(super) unsafe fn create_viewer(
 
     let st = Box::new(ViewerState {
         manual,
+        manual_launch,
         shot: shot.is_some(),
         path: RefCell::new(None),
         kind: Cell::new(ContentKind::Loading),
@@ -676,11 +684,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_ACTIVATE => {
                 // Close-on-focus-loss (opt-in setting; never when pinned; not during the open
-                // grace so a just-shown, never-activated window can't self-close).
+                // grace so a just-shown, never-activated window can't self-close). Applies in
+                // Toggle mode only — in HoldPeek mode the release already closes, and the
+                // viewer never activates while held (SW_SHOWNOACTIVATE), so the setting is
+                // meaningless there. Hand launches (`--preview <path>`, manual_launch) keep
+                // the pre-mode behaviour: close-on-focus-loss applies regardless of mode.
                 let st = &*state(hwnd);
+                let mode_ok = st.manual_launch
+                    || sagethumbs2k_core::settings::preview_space_mode()
+                        == sagethumbs2k_core::settings::SpaceMode::Toggle;
                 if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE
                     && !st.pinned.get()
                     && GetTickCount64().saturating_sub(st.born.get()) >= SETTLE_CLOSE_MS
+                    && mode_ok
                     && sagethumbs2k_core::settings::preview_close_on_focus_loss()
                 {
                     request_close(hwnd);

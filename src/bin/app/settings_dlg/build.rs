@@ -282,7 +282,24 @@ pub(super) unsafe fn build_controls(hwnd: HWND, hinst: HINSTANCE) {
     // apply_settings, which persists it before the reconcile); the rest are viewer
     // behavior prefs. All are placed into the "Quick preview" nav category by cat_rows.
     lc.checkbox(t("chk_preview_enabled"), cb, 312, ID_PREVIEW_ENABLED);
-    lc.checkbox(t("chk_preview_hold_peek"), cb, 312, ID_PREVIEW_HOLD_PEEK);
+    // Space-key behaviour: two MUTUALLY EXCLUSIVE modes (a radio pair, first one
+    // carries WS_GROUP). The close-on-focus-loss option below is gated by the
+    // selected mode (see update_space_mode_enabled).
+    let rb = WINDOW_STYLE(BS_AUTORADIOBUTTON as u32);
+    lc.radio(
+        t("chk_preview_mode_toggle"),
+        rb,
+        312,
+        ID_PREVIEW_MODE_TOGGLE,
+        true,
+    );
+    lc.radio(
+        t("chk_preview_hold_peek"),
+        rb,
+        312,
+        ID_PREVIEW_HOLD_PEEK,
+        false,
+    );
     lc.checkbox(
         t("chk_preview_close_focus"),
         cb,

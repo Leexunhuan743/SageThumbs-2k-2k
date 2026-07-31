@@ -158,6 +158,21 @@ impl LeftCol {
         self.y += 20;
     }
 
+    /// A full-width radio row (same compact row geometry as [`Self::checkbox`]). The
+    /// FIRST radio of a mutually exclusive group carries `WS_GROUP` so the group is
+    /// exclusive and tab-stop-contained; the others omit it.
+    unsafe fn radio(&mut self, text: &str, style: WINDOW_STYLE, w: i32, id: i32, first: bool) {
+        self.y += MT_CHECK;
+        let mut st = style;
+        if first {
+            st.0 |= WS_GROUP.0;
+        }
+        ctl(
+            self.hwnd, BUTTON, text, st, INDENT, self.y, w, 20, id, self.hinst,
+        );
+        self.y += 20;
+    }
+
     /// `label:` + a right-aligned numeric edit; returns the edit hwnd. The label is
     /// dropped 1px to sit against the field. `lbl_id` keeps it live-retranslatable AND
     /// tooltip-targetable, and `SS_NOTIFY` makes it mouse-receptive so a hover tooltip on
@@ -460,6 +475,7 @@ const TOOLTIPS: &[(i32, &str)] = &[
     (ID_SHOT_HIDE_TRAY, "tip_hide_tray"),
     (ID_CUSTOM_ACTION_ENABLE, "tip_custom_action_enable"),
     (ID_PREVIEW_ENABLED, "tip_preview_enabled"),
+    (ID_PREVIEW_MODE_TOGGLE, "tip_preview_mode_toggle"),
     (ID_PREVIEW_HOLD_PEEK, "tip_preview_hold_peek"),
     (ID_PREVIEW_CLOSE_FOCUS, "tip_preview_close_focus"),
     (ID_PREVIEW_TOPMOST, "tip_preview_topmost"),
@@ -1091,6 +1107,11 @@ pub(crate) extern "system" fn wndproc(
                     // Instant-screenshot checkbox: enable/disable its hotkey picker live.
                     ID_SHOT_ENABLE => refresh_shot_status(hwnd),
                     ID_SHOT_QUICK_ENABLE => update_quick_enabled(hwnd),
+                    // Space-key mode radio pair: the buttons self-exclude; only the
+                    // close-on-focus-loss grey-out needs refreshing.
+                    ID_PREVIEW_MODE_TOGGLE | ID_PREVIEW_HOLD_PEEK => {
+                        update_space_mode_enabled(hwnd)
+                    }
                     ID_CUSTOM_ACTION_ENABLE => update_custom_action_enabled(hwnd),
                     ID_SHOT_USE_DIR => update_save_dir_enabled(hwnd),
                     ID_SYNC_BTN => on_sync_click(hwnd),

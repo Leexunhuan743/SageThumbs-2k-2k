@@ -25,7 +25,7 @@ pub(super) unsafe fn run_shot(
         None
     };
     let path = opts.file.clone().or_else(|| tmp.clone());
-    let Some(hwnd) = create_viewer(hinst, dark, path, Some(opts)) else {
+    let Some(hwnd) = create_viewer(hinst, dark, path, Some(opts), false) else {
         if let Some(t) = &tmp {
             let _ = std::fs::remove_file(t);
         }

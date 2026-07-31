@@ -126,7 +126,8 @@ pub(super) const ID_EDIT_UPLOAD_HOSTS: i32 = 1187;
 // residency (like the screenshot service); the three below are viewer-behavior prefs.
 // Control IDs stop at 1202 (ID_SYNC_STATUS); nav IDs start at 1700, so 1203+ is free.
 pub(super) const ID_PREVIEW_ENABLED: i32 = 1203;
-pub(super) const ID_PREVIEW_HOLD_PEEK: i32 = 1204;
+pub(super) const ID_PREVIEW_MODE_TOGGLE: i32 = 1213; // radio: space = click to toggle
+pub(super) const ID_PREVIEW_HOLD_PEEK: i32 = 1204; // radio: space = hold to peek
 pub(super) const ID_PREVIEW_CLOSE_FOCUS: i32 = 1205;
 pub(super) const ID_PREVIEW_TOPMOST: i32 = 1206;
 // Phase 3: preview text/code + render markdown.

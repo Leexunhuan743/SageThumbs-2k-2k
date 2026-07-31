@@ -11,9 +11,14 @@
 //!   so the callback does only cheap user32 calls + a `PostMessageW` to the daemon. NO COM, NO
 //!   file I/O, NO decode, NO window creation. The daemon's re-arm timer reinstalls us if
 //!   Windows ever drops the hook.
-//! - **Latch the down-tick.** A qualifying Space key-down latches "this press is ours" + the
-//!   time; auto-repeat key-downs are ignored (debounce); the key-up uses the LATCHED verdict,
+//! - **Latch the down-tick.** A qualifying Space key-down latches "this press is ours";
+//!   auto-repeat key-downs are ignored (debounce); the key-up uses the LATCHED verdict,
 //!   never a re-check of the (possibly changed) foreground window.
+//! - **Two mutually exclusive Space modes** (`PreviewSpaceMode`, radio-pair in the settings
+//!   dialog): Toggle (a click shows, another click closes — space is a switch) and HoldPeek
+//!   (hold to view, ANY release closes — no duration threshold; the mode is explicit, not
+//!   a 750 ms guess). The modes diverge in exactly one place: the down-message posted
+//!   (toggle vs show-only) and whether the release posts close.
 //! - **This is NOT a keylogger.** It reads only the vk of the event, looks at Space/Esc/Enter,
 //!   and posts a message. It captures no text, logs nothing, sends nothing anywhere.
 //!
@@ -21,12 +26,11 @@
 //! must pump messages — the daemon does), so the state below is only ever touched there.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT,
     VK_SPACE,
@@ -37,24 +41,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HHOOK, KBDLLHOOKSTRUCT, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
-/// Posted to the daemon window on a qualifying Space press (toggle the preview).
+/// Posted to the daemon window on a qualifying Space press in TOGGLE mode
+/// (open/close switch — see [`crate::preview::request_toggle`]).
 pub(super) const WM_APP_PREVIEW: u32 = WM_APP + 4;
-/// Posted on Esc / Enter / a hold-to-peek release (close the preview if it's open).
+/// Posted on Esc / Enter / a hold-mode Space release (close the preview if it's open).
 pub(super) const WM_APP_PREVIEW_CLOSE: u32 = WM_APP + 5;
-
-/// Hold Space at least this long, then release = "peek" (close on release). Mirrors
-/// QuickLook's `HOLD_TO_PREVIEW_DURATION`.
-const HOLD_PEEK_MS: u64 = 750;
+/// Posted on a qualifying Space press in HOLD mode: show only, never toggle an
+/// already-open window (the release closes it).
+pub(super) const WM_APP_PREVIEW_SHOW: u32 = WM_APP + 6;
 
 static HOOK: AtomicIsize = AtomicIsize::new(0);
 static DAEMON_HWND: AtomicIsize = AtomicIsize::new(0);
 static SPACE_LATCHED: AtomicBool = AtomicBool::new(false);
-static SPACE_DOWN_TICK: AtomicU64 = AtomicU64::new(0);
-/// Cached `preview_hold_peek()` — read ONCE in [`rearm`] (never from inside the hook
-/// callback), because a registry read can block on I/O and a slow LL-hook callback gets
-/// silently unhooked by Windows. Refreshed on every re-arm (startup / WM_RELOAD / the 60 s
-/// timer), so it's at most 60 s stale.
-static HOLD_PEEK: AtomicBool = AtomicBool::new(true);
+/// Cached `preview_space_mode()` (0 = Toggle, 1 = HoldPeek) — read ONCE in [`rearm`]
+/// (never from inside the hook callback), because a registry read can block on I/O and a
+/// slow LL-hook callback gets silently unhooked by Windows. Refreshed on every re-arm
+/// (startup / WM_RELOAD / the 60 s timer), so it's at most 60 s stale.
+static SPACE_MODE: AtomicU8 = AtomicU8::new(0);
 
 /// Install the hook when Quick preview is enabled; remove it otherwise. Idempotent
 /// (uninstall-then-install), so the daemon can call this at startup, on `WM_RELOAD` (the
@@ -63,9 +66,12 @@ static HOLD_PEEK: AtomicBool = AtomicBool::new(true);
 /// slow LL hook too.
 pub(super) unsafe fn rearm(daemon_hwnd: HWND) {
     DAEMON_HWND.store(daemon_hwnd.0 as isize, Ordering::Relaxed);
-    // Cache the hold-to-peek setting here (on the daemon thread), NOT in the hook callback.
-    HOLD_PEEK.store(
-        sagethumbs2k_core::settings::preview_hold_peek(),
+    // Cache the space-key mode here (on the daemon thread), NOT in the hook callback.
+    SPACE_MODE.store(
+        match sagethumbs2k_core::settings::preview_space_mode() {
+            sagethumbs2k_core::settings::SpaceMode::Toggle => 0,
+            sagethumbs2k_core::settings::SpaceMode::HoldPeek => 1,
+        },
         Ordering::Relaxed,
     );
     uninstall();
@@ -118,13 +124,23 @@ unsafe fn handle_key(vk: u32, is_down: bool) {
             }
             if qualifies() {
                 SPACE_LATCHED.store(true, Ordering::Relaxed);
-                SPACE_DOWN_TICK.store(GetTickCount64(), Ordering::Relaxed);
-                let _ = PostMessageW(Some(daemon), WM_APP_PREVIEW, WPARAM(0), LPARAM(0));
+                // Toggle mode: one press toggles open/closed (space is a switch).
+                // Hold mode: SHOW only — an already-open window must NOT be toggled
+                // away mid-hold; the release closes it. The two modes are mutually
+                // exclusive settings, so this is the only divergence point.
+                let msg = if SPACE_MODE.load(Ordering::Relaxed) == 1 {
+                    WM_APP_PREVIEW_SHOW
+                } else {
+                    WM_APP_PREVIEW
+                };
+                let _ = PostMessageW(Some(daemon), msg, WPARAM(0), LPARAM(0));
             }
         } else if SPACE_LATCHED.swap(false, Ordering::Relaxed) {
-            // Key-up decision uses the LATCHED verdict (QuickLook keeps the down-time judgment).
-            let held = GetTickCount64().saturating_sub(SPACE_DOWN_TICK.load(Ordering::Relaxed));
-            if held >= HOLD_PEEK_MS && HOLD_PEEK.load(Ordering::Relaxed) {
+            // Key-up decision uses the LATCHED verdict (QuickLook keeps the down-time
+            // judgment). Hold mode closes on ANY release — no duration threshold: the
+            // mode is an explicit setting, not a 750 ms guess. Toggle mode ignores the
+            // release entirely (the next press flips it back).
+            if SPACE_MODE.load(Ordering::Relaxed) == 1 {
                 let _ = PostMessageW(Some(daemon), WM_APP_PREVIEW_CLOSE, WPARAM(0), LPARAM(0));
             }
         }

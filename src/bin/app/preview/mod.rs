@@ -122,7 +122,10 @@ pub(crate) unsafe fn run_preview(hinst: HINSTANCE, initial_path: Option<&str>) {
     };
 
     let dark = crate::dark::is_dark();
-    let Some(_hwnd) = window::create_viewer(hinst, dark, Some(path), None) else {
+    // A hand launch (`--preview <path>`) carries an explicit path — the daemon's Space
+    // spawn carries none — which is what `manual_launch` means for close-on-focus-loss.
+    let Some(_hwnd) = window::create_viewer(hinst, dark, Some(path), None, initial_path.is_some())
+    else {
         return;
     };
 
@@ -233,6 +236,24 @@ pub(crate) unsafe fn request_close() {
     if let Ok(hwnd) = FindWindowW(VIEWER_CLASS, PCWSTR::null()) {
         send_command(hwnd, CMD_CLOSE, None);
     }
+}
+
+/// Daemon-side HOLD-mode "Space pressed" handler: show the viewer if none is up;
+/// NEVER toggle an already-open window (the release posts [`request_close`], and
+/// toggling it away mid-hold would make the mode unusable). Shares the same
+/// spawn debounce as [`request_toggle`] so a fast toggle/hold press pair can't
+/// open two windows.
+pub(crate) unsafe fn request_show() {
+    if FindWindowW(VIEWER_CLASS, PCWSTR::null()).is_ok() {
+        return; // already open — hold mode never toggles; the release closes it
+    }
+    let now = GetTickCount64();
+    let last = SPAWN_TICK.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 2000 {
+        return; // a spawn is already in flight
+    }
+    SPAWN_TICK.store(now, Ordering::Relaxed);
+    spawn_self(&["--preview"]);
 }
 
 /// Headless `--shot --window preview` options. Lets the off-screen capture force the runtime-only

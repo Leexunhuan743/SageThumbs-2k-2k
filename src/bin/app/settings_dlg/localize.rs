@@ -95,6 +95,7 @@ pub(super) unsafe fn apply_labels(hwnd: HWND) {
         (ID_LBL_SHOT_ACTION_HK, "lbl_custom_action_hk"),
         (ID_CUSTOM_ACTION_ENABLE, "chk_custom_action"),
         (ID_PREVIEW_ENABLED, "chk_preview_enabled"),
+        (ID_PREVIEW_MODE_TOGGLE, "chk_preview_mode_toggle"),
         (ID_PREVIEW_HOLD_PEEK, "chk_preview_hold_peek"),
         (ID_PREVIEW_CLOSE_FOCUS, "chk_preview_close_focus"),
         (ID_PREVIEW_TOPMOST, "chk_preview_topmost"),

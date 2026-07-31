@@ -546,13 +546,32 @@ pub fn set_preview_enabled(on: bool) -> windows_registry::Result<()> {
     set_dword("PreviewEnabled", on as u32)
 }
 
-/// Hold Space >= 750 ms then release closes the preview ("peek"). ON by default.
-pub fn preview_hold_peek() -> bool {
-    get_dword("PreviewHoldPeek", 1) != 0
+/// How the Space key drives the Quick preview. Two MUTUALLY EXCLUSIVE modes —
+/// the settings dialog renders them as a radio pair, never both:
+/// `Toggle` = a click shows, another click closes (space is a switch);
+/// `HoldPeek` = hold to view, ANY release closes (no duration threshold — the
+/// mode is explicit, not guessed). Toggle is the default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpaceMode {
+    Toggle = 0,
+    HoldPeek = 1,
 }
-/// Persist the hold-to-peek toggle.
-pub fn set_preview_hold_peek(on: bool) -> windows_registry::Result<()> {
-    set_dword("PreviewHoldPeek", on as u32)
+
+/// Which Space-key behaviour the Quick preview uses (`PreviewSpaceMode`,
+/// default `Toggle`).
+///
+/// The old `PreviewHoldPeek` boolean (the 750 ms hold-guess) is intentionally
+/// NOT migrated: this replacement is a reviewed design change, and dev-stage
+/// users get the default.
+pub fn preview_space_mode() -> SpaceMode {
+    match get_dword("PreviewSpaceMode", 0) {
+        1 => SpaceMode::HoldPeek,
+        _ => SpaceMode::Toggle,
+    }
+}
+/// Persist the Space-key preview mode.
+pub fn set_preview_space_mode(mode: SpaceMode) -> windows_registry::Result<()> {
+    set_dword("PreviewSpaceMode", mode as u32)
 }
 
 /// Close the viewer when it loses focus (and isn't pinned). OFF by default.

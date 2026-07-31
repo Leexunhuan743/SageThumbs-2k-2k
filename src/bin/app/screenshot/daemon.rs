@@ -399,6 +399,10 @@ extern "system" fn daemon_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 crate::preview::request_toggle();
                 LRESULT(0)
             }
+            m if m == super::spacehook::WM_APP_PREVIEW_SHOW => {
+                crate::preview::request_show();
+                LRESULT(0)
+            }
             m if m == super::spacehook::WM_APP_PREVIEW_CLOSE => {
                 crate::preview::request_close();
                 LRESULT(0)

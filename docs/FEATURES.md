@@ -227,10 +227,18 @@ allow custom bitmap items.*
 ## 3. Quick preview (press Space, see the file)
 
 A QuickLook-style instant previewer, off by default (enable it in **Settings ▸ Quick preview**).
-Tap **Space** in Explorer (or on the Desktop) and a borderless, dark/DPI-aware popup shows the
-selected file at full size, without stealing focus from Explorer; tap Space again (or Esc) to
-close, or hold Space and release to "peek". While it's open, arrow-clicking a different file in
-Explorer follows the selection. A selected **`.lnk` shortcut** resolves to its target.
+Two mutually exclusive Space-key modes (a radio pair in Settings — Toggle is the default):
+
+- **Toggle**: tap **Space** in Explorer (or on the Desktop) and a borderless, dark/DPI-aware popup
+  shows the selected file at full size, without stealing focus from Explorer; tap Space again (or
+  Esc) to close.
+- **Hold to peek**: hold Space to view, release to close (no duration threshold — the mode is
+  explicit, not a 750 ms guess).
+
+"Close when the preview loses focus" applies to Toggle mode (and hand-launched `--preview`
+windows); in Hold mode the release already closes, so the option is greyed out. While it's open,
+arrow-clicking a different file in Explorer follows the selection. A selected **`.lnk` shortcut**
+resolves to its target.
 
 It previews **everything the thumbnailer can decode** (all the image/RAW/ebook/office/… formats),
 plus these viewer-only extras:
