@@ -477,8 +477,8 @@ mod tests {
             hdr.extend_from_slice(&0i16.to_le_bytes()); // last_dc
         }
         hdr.extend_from_slice(&0u16.to_le_bytes()); // padding
-        // GRB: 64 bytes of garbage. 64 (file size) - 64 (garbage) - 92 (header
-        // read) - 2 (SOI) underflows on unpatched code.
+                                                    // GRB: 64 bytes of garbage. 64 (file size) - 64 (garbage) - 92 (header
+                                                    // read) - 2 (SOI) underflows on unpatched code.
         hdr.extend_from_slice(b"GRB");
         hdr.extend_from_slice(&64u32.to_le_bytes());
         hdr.extend_from_slice(&[0; 64]);
@@ -499,8 +499,7 @@ mod tests {
         // Same parseable raw header as above (SOF0 + DQT + SOS, 92 bytes).
         let mut raw = Vec::new();
         raw.extend_from_slice(&[
-            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01,
-            0x11, 0x00,
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00,
         ]);
         raw.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
         raw.extend_from_slice(&[1; 64]);
