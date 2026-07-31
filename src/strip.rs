@@ -146,12 +146,36 @@ fn exif_from_path(path: &str) -> Option<exif::Exif> {
         .as_deref()
         .is_some_and(|h| h.starts_with(&[0xCF, 0x84]))
     {
-        return crate::decode::read_capped(path)
-            .ok()
-            .and_then(|b| crate::decode::lepton::probe_exif(&b));
+        return lep_container_header(path).and_then(|b| crate::decode::lepton::probe_exif(&b));
     }
     let mut buf = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     exif::Reader::new().read_from_container(&mut buf).ok()
+}
+
+/// Reads ONLY the lepton container's compressed header — the 28-byte fixed
+/// header plus the declared `compressed_header_size` (capped at the tier's
+/// 128 MiB budget) — which is every byte the lepton header probes touch.
+/// `.lep` is the one format whose Details-pane probe used to slurp the WHOLE
+/// file (read_capped, up to 256 MiB) twice per file (read_info + exif_from_
+/// path) and inflate the header twice; a folder of large .lep files burned
+/// that serially inside the in-process shell host. None on I/O error / a
+/// non-lepton / an absurd declared size.
+fn lep_container_header(path: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut fixed = [0u8; 28];
+    f.read_exact(&mut fixed).ok()?;
+    if !fixed.starts_with(&[0xCF, 0x84]) {
+        return None;
+    }
+    let csz = u32::from_le_bytes(fixed[24..28].try_into().ok()?) as usize;
+    if csz > crate::decode::lepton::MAX_JPEG_FILE_SIZE as usize {
+        return None;
+    }
+    let mut buf = fixed.to_vec();
+    buf.resize(28 + csz, 0);
+    f.read_exact(&mut buf[28..]).ok()?;
+    Some(buf)
 }
 
 /// Map EXIF fields onto the Details-pane properties: make/model, capture time
@@ -239,7 +263,10 @@ fn read_info_impl(path: &str, bounded: bool) -> ImageInfo {
                 .as_deref()
                 .is_some_and(|h| h.starts_with(&[0xCF, 0x84]))
         {
-            if let Ok(bytes) = crate::decode::read_capped(path) {
+            // Header-only read: 28 fixed bytes + the declared compressed
+            // header — never the whole file (read_capped used to slurp up to
+            // 256 MiB per .lep file on the bounded Details-pane path).
+            if let Some(bytes) = lep_container_header(path) {
                 if let Some((h, w)) = crate::decode::lepton::probe_dimensions(&bytes) {
                     info.width = w;
                     info.height = h;
@@ -318,7 +345,6 @@ fn gps_dms(exif: &exif::Exif, coord: exif::Tag, refr: exif::Tag, neg_ref: u8) ->
 /// the terse struct the CLI uses). Returns a ready-to-display multi-line string with LF
 /// endings (the dialog converts to CRLF for the edit control).
 pub fn read_info_verbose(path: &str) -> String {
-    use exif::Reader;
     use image::ImageDecoder;
     use std::fmt::Write as _;
 
@@ -385,29 +411,29 @@ pub fn read_info_verbose(path: &str) -> String {
 
     let _ = writeln!(s, "── EXIF / metadata ──");
     let mut had_exif = false;
-    if let Ok(file) = std::fs::File::open(path) {
-        let mut buf = std::io::BufReader::new(file);
-        if let Ok(exif) = Reader::new().read_from_container(&mut buf) {
-            had_exif = true;
-            for f in exif.fields() {
-                let _ = writeln!(s, "{}: {}", f.tag, f.display_value().with_unit(&exif));
-            }
-            let lat = gps_dms(
-                &exif,
-                exif::Tag::GPSLatitude,
-                exif::Tag::GPSLatitudeRef,
-                b'S',
-            );
-            let lon = gps_dms(
-                &exif,
-                exif::Tag::GPSLongitude,
-                exif::Tag::GPSLongitudeRef,
-                b'W',
-            );
-            if let (Some(la), Some(lo)) = (lat, lon) {
-                let _ = writeln!(s, "\nGPS (decimal): {la:.6}, {lo:.6}");
-                let _ = writeln!(s, "Map: https://maps.google.com/?q={la:.6},{lo:.6}");
-            }
+    // Shared with the Details pane (exif_from_path handles .lep containers via
+    // the bounded header probe — a raw read_from_container on the container
+    // bytes would always report "(none)" for them).
+    if let Some(exif) = exif_from_path(path) {
+        had_exif = true;
+        for f in exif.fields() {
+            let _ = writeln!(s, "{}: {}", f.tag, f.display_value().with_unit(&exif));
+        }
+        let lat = gps_dms(
+            &exif,
+            exif::Tag::GPSLatitude,
+            exif::Tag::GPSLatitudeRef,
+            b'S',
+        );
+        let lon = gps_dms(
+            &exif,
+            exif::Tag::GPSLongitude,
+            exif::Tag::GPSLongitudeRef,
+            b'W',
+        );
+        if let (Some(la), Some(lo)) = (lat, lon) {
+            let _ = writeln!(s, "\nGPS (decimal): {la:.6}, {lo:.6}");
+            let _ = writeln!(s, "Map: https://maps.google.com/?q={la:.6},{lo:.6}");
         }
     }
     if !had_exif {
