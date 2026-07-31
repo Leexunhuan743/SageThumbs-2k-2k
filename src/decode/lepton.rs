@@ -50,7 +50,13 @@ pub(super) fn decode_lepton(bytes: &[u8]) -> Result<DynamicImage> {
     // rule — the same reason rayon is kept out of the DLL).
     let pool = SimpleThreadPool::new(LeptonThreadPriority::Normal);
     let mut jpeg = Vec::new();
-    lepton_decode(&mut std::io::Cursor::new(bytes), &mut jpeg, &features, &pool).map_err(|e| {
+    lepton_decode(
+        &mut std::io::Cursor::new(bytes),
+        &mut jpeg,
+        &features,
+        &pool,
+    )
+    .map_err(|e| {
         crate::safety::log_debug(&format!("lepton decode error: {e:?}"));
         Error::from(E_FAIL)
     })?;
@@ -96,7 +102,7 @@ mod tests {
     /// dead-stripped from the release DLL but compiles in dev/test builds from the
     /// same dependency.
     fn lepton_bytes(jpeg: &[u8]) -> Vec<u8> {
-        use lepton_jpeg::{DEFAULT_THREAD_POOL, EnabledFeatures};
+        use lepton_jpeg::{EnabledFeatures, DEFAULT_THREAD_POOL};
         let feats = EnabledFeatures {
             progressive: true,
             reject_dqts_with_zeros: false,
@@ -124,10 +130,25 @@ mod tests {
         assert_eq!((img.width(), img.height()), (96, 64));
         // Bit-exact container ⇒ pixels identical to decoding the original JPEG.
         let reference = super::super::decode_with_image(&jpeg).unwrap();
-        assert_eq!(
-            img.to_rgb8().into_raw(),
-            reference.to_rgb8().into_raw()
-        );
+        assert_eq!(img.to_rgb8().into_raw(), reference.to_rgb8().into_raw());
+    }
+
+    #[test]
+    fn committed_fixture_decodes_to_reference_pixels() {
+        // Provenance: `regenerate_fixture` encodes test_jpeg(640, 480); the lepton
+        // container is bit-exact, so the committed fixture must decode to exactly
+        // the same pixels as the source JPEG. Keeps tests/fixtures/lepton.lep live
+        // and proves it matches the current encoder output.
+        let lep = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/lepton.lep"
+        ))
+        .expect("fixture must be committed");
+        assert!(looks_like_lepton(&lep));
+        let img = decode_lepton(&lep).expect("committed fixture must decode");
+        assert_eq!((img.width(), img.height()), (640, 480));
+        let reference = super::super::decode_with_image(&test_jpeg(640, 480)).unwrap();
+        assert_eq!(img.to_rgb8().into_raw(), reference.to_rgb8().into_raw());
     }
 
     #[test]
@@ -145,17 +166,15 @@ mod tests {
     }
 
     /// Regenerates tests/fixtures/lepton.lep. Run manually when the committed
-    /// fixture needs refreshing (the fixture is what the CLI/preview smoke tests
-    /// use): `cargo test decode::lepton::tests::regenerate_fixture -- --ignored`.
+    /// fixture needs refreshing (it is exercised by
+    /// `committed_fixture_decodes_to_reference_pixels`):
+    /// `cargo test decode::lepton::tests::regenerate_fixture -- --ignored`.
     #[test]
     #[ignore = "manual fixture regeneration"]
     fn regenerate_fixture() {
         let lep = lepton_bytes(&test_jpeg(640, 480));
         std::fs::write(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/lepton.lep"
-            ),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lepton.lep"),
             &lep,
         )
         .unwrap();
