@@ -136,8 +136,68 @@ fn head_prefix(path: &str) -> Option<Vec<u8>> {
     (buf.len() >= 26).then_some(buf)
 }
 
+/// EXIF for `path`. Ordinary files are handed to the parser as-is; .lep
+/// containers are not JPEG (the parser needs a walkable SOI..SOS stream), so
+/// their zlib-compressed header is decompressed with the bounded lepton probe
+/// (no pixel decode) and the reconstructed stream is parsed instead. `None` =
+/// no EXIF / malformed / unreadable — never a panic.
+fn exif_from_path(path: &str) -> Option<exif::Exif> {
+    if head_prefix(path)
+        .as_deref()
+        .is_some_and(|h| h.starts_with(&[0xCF, 0x84]))
+    {
+        return crate::decode::read_capped(path)
+            .ok()
+            .and_then(|b| crate::decode::lepton::probe_exif(&b));
+    }
+    let mut buf = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    exif::Reader::new().read_from_container(&mut buf).ok()
+}
+
+/// Map EXIF fields onto the Details-pane properties: make/model, capture time
+/// (DateTimeOriginal only — never the file-mtime DateTime), print resolution
+/// normalized to DPI, and GPS. Shared by the ordinary-file and .lep paths.
+fn fill_exif_fields(info: &mut ImageInfo, exif: &exif::Exif) {
+    use exif::{In, Tag, Value};
+    let txt = |t: Tag| {
+        exif.get_field(t, In::PRIMARY)
+            .map(|f| f.display_value().with_unit(exif).to_string())
+    };
+    info.make = txt(Tag::Make);
+    info.model = txt(Tag::Model);
+    // CAPTURE time only — NOT a fallback to Tag::DateTime (the file-modified stamp editors
+    // write), because this feeds System.Photo.DateTaken. Showing an edit timestamp as "Date
+    // taken" is wrong and inconsistent with Windows' own photo handler (which never falls back).
+    info.datetime = txt(Tag::DateTimeOriginal);
+
+    // Print resolution (DPI). ResolutionUnit: 2 = inches (the usual), 3 = cm — cm
+    // values are normalized to inches so the property is always pixels-per-inch.
+    let unit = exif
+        .get_field(Tag::ResolutionUnit, In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        .unwrap_or(2);
+    let res = |t: Tag| -> Option<f64> {
+        match &exif.get_field(t, In::PRIMARY)?.value {
+            Value::Rational(r) => r.first().map(|x| x.to_f64()),
+            _ => None,
+        }
+    };
+    let to_dpi = |v: f64| if unit == 3 { v * 2.54 } else { v };
+    if let Some(x) = res(Tag::XResolution) {
+        info.dpi_x = to_dpi(x);
+    }
+    if let Some(y) = res(Tag::YResolution) {
+        info.dpi_y = to_dpi(y);
+    }
+
+    let lat = gps_dms(exif, Tag::GPSLatitude, Tag::GPSLatitudeRef, b'S');
+    let lon = gps_dms(exif, Tag::GPSLongitude, Tag::GPSLongitudeRef, b'W');
+    if let (Some(la), Some(lo)) = (lat, lon) {
+        info.gps = Some((la, lo));
+    }
+}
+
 fn read_info_impl(path: &str, bounded: bool) -> ImageInfo {
-    use exif::{In, Reader, Tag, Value};
     use image::ImageDecoder;
     let mut info = ImageInfo::default();
 
@@ -227,49 +287,8 @@ fn read_info_impl(path: &str, bounded: bool) -> ImageInfo {
         }
     }
 
-    let Ok(file) = std::fs::File::open(path) else {
-        return info;
-    };
-    let mut buf = std::io::BufReader::new(file);
-    let Ok(exif) = Reader::new().read_from_container(&mut buf) else {
-        return info;
-    };
-
-    let txt = |t: Tag| {
-        exif.get_field(t, In::PRIMARY)
-            .map(|f| f.display_value().with_unit(&exif).to_string())
-    };
-    info.make = txt(Tag::Make);
-    info.model = txt(Tag::Model);
-    // CAPTURE time only — NOT a fallback to Tag::DateTime (the file-modified stamp editors
-    // write), because this feeds System.Photo.DateTaken. Showing an edit timestamp as "Date
-    // taken" is wrong and inconsistent with Windows' own photo handler (which never falls back).
-    info.datetime = txt(Tag::DateTimeOriginal);
-
-    // Print resolution (DPI). ResolutionUnit: 2 = inches (the usual), 3 = cm — cm
-    // values are normalized to inches so the property is always pixels-per-inch.
-    let unit = exif
-        .get_field(Tag::ResolutionUnit, In::PRIMARY)
-        .and_then(|f| f.value.get_uint(0))
-        .unwrap_or(2);
-    let res = |t: Tag| -> Option<f64> {
-        match &exif.get_field(t, In::PRIMARY)?.value {
-            Value::Rational(r) => r.first().map(|x| x.to_f64()),
-            _ => None,
-        }
-    };
-    let to_dpi = |v: f64| if unit == 3 { v * 2.54 } else { v };
-    if let Some(x) = res(Tag::XResolution) {
-        info.dpi_x = to_dpi(x);
-    }
-    if let Some(y) = res(Tag::YResolution) {
-        info.dpi_y = to_dpi(y);
-    }
-
-    let lat = gps_dms(&exif, Tag::GPSLatitude, Tag::GPSLatitudeRef, b'S');
-    let lon = gps_dms(&exif, Tag::GPSLongitude, Tag::GPSLongitudeRef, b'W');
-    if let (Some(la), Some(lo)) = (lat, lon) {
-        info.gps = Some((la, lo));
+    if let Some(exif) = exif_from_path(path) {
+        fill_exif_fields(&mut info, &exif);
     }
     info
 }
@@ -412,14 +431,10 @@ pub struct CaptureMeta {
 /// the strings are clean enough to put in a filename, and reshapes the EXIF
 /// `"YYYY:MM:DD HH:MM:SS"` into a colon-free form Windows accepts.
 pub fn read_capture(path: &str) -> CaptureMeta {
-    use exif::{In, Reader, Tag, Value};
+    use exif::{In, Tag, Value};
     let mut out = CaptureMeta::default();
 
-    let Ok(file) = std::fs::File::open(path) else {
-        return out;
-    };
-    let mut buf = std::io::BufReader::new(file);
-    let Ok(exif) = Reader::new().read_from_container(&mut buf) else {
+    let Some(exif) = exif_from_path(path) else {
         return out;
     };
 
@@ -659,5 +674,81 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lepton.lep");
         let info = read_info_bounded(path);
         assert_eq!((info.width, info.height), (640, 480));
+    }
+
+    /// Wrap a raw JPEG header in a minimal lepton container (fixed header +
+    /// zlib "HDR" section) — the same shape the decode tier's hostile_lep
+    /// builds, minus the CMP trailer (metadata probes never reach it).
+    fn lepton_container(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(raw);
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&hdr).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut lep = Vec::new();
+        lep.extend_from_slice(&[0xCF, 0x84, 0x01, b'Z', 0, 0, 0, 0]);
+        lep.extend_from_slice(b"MS");
+        lep.extend_from_slice(&0u32.to_le_bytes()); // legacy header size
+        lep.push(0x80); // flags
+        lep.push(1); // encoder version (not 55 — no truncation path)
+        lep.extend_from_slice(&[0; 4]); // git prefix
+        lep.extend_from_slice(&100_000u32.to_le_bytes()); // jpeg_file_size
+        lep.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        lep.extend_from_slice(&compressed);
+        lep
+    }
+
+    /// Camera EXIF inside a .lep container must surface in BOTH the Details
+    /// pane reader (`read_info`) and the rename-by-date reader (`read_capture`)
+    /// — the container itself is not a JPEG, so the tags are read from the
+    /// decompressed header (probe_exif).
+    #[test]
+    fn lepton_exif_surfaces_in_read_info_and_read_capture() {
+        // APP1 (Exif): Make "Canon" + DateTimeOriginal "2026:07:31 12:00:00",
+        // then SOF0 64x64 + SOS so the header is a parseable JPEG too.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x59]);
+        raw.extend_from_slice(b"Exif\0\0");
+        raw.extend_from_slice(b"II*\0");
+        raw.extend_from_slice(&8u32.to_le_bytes());
+        raw.extend_from_slice(&2u16.to_le_bytes());
+        raw.extend_from_slice(&0x010Fu16.to_le_bytes()); // Make (Tiff IFD0)
+        raw.extend_from_slice(&2u16.to_le_bytes());
+        raw.extend_from_slice(&5u32.to_le_bytes());
+        raw.extend_from_slice(&38u32.to_le_bytes());
+        // ExifIFDPointer -> the Exif sub-IFD (Context::Exif — kamadak's
+        // DateTimeOriginal constant carries that context).
+        raw.extend_from_slice(&0x8769u16.to_le_bytes());
+        raw.extend_from_slice(&4u16.to_le_bytes()); // LONG
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&44u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+        raw.extend_from_slice(b"Canon");
+        raw.push(0); // pad — the Exif IFD must start at TIFF-relative 44
+        raw.extend_from_slice(&1u16.to_le_bytes()); // Exif IFD: one entry
+        raw.extend_from_slice(&0x9003u16.to_le_bytes()); // DateTimeOriginal
+        raw.extend_from_slice(&2u16.to_le_bytes());
+        raw.extend_from_slice(&19u32.to_le_bytes());
+        raw.extend_from_slice(&62u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes()); // next Exif IFD
+        raw.extend_from_slice(b"2026:07:31 12:00:00");
+        raw.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00, 0xFF,
+            0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
+        ]);
+        let lep = lepton_container(&raw);
+        let path = std::env::temp_dir().join("sagethumbs_lepton_exif_test.lep");
+        std::fs::write(&path, &lep).unwrap();
+        let info = read_info(path.to_str().unwrap());
+        assert_eq!((info.width, info.height), (64, 64));
+        // kamadak renders ASCII values quoted (same as every JPEG's Details pane).
+        assert_eq!(info.make.as_deref(), Some("\"Canon\""));
+        let meta = read_capture(path.to_str().unwrap());
+        assert_eq!(meta.time.as_deref(), Some("2026-07-31 12.00.00"));
+        assert_eq!(meta.camera.as_deref(), Some("Canon"));
+        std::fs::remove_file(&path).ok();
     }
 }

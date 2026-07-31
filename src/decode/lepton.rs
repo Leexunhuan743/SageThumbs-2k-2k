@@ -85,21 +85,14 @@ pub(super) fn decode_lepton(bytes: &[u8]) -> Result<DynamicImage> {
     ))
 }
 
-/// Probe ONLY the container's compressed header for the embedded JPEG's
-/// dimensions — no pixel decode, no thread pool. The property handler's
-/// [`read_info_bounded`](crate::strip::read_info_bounded) path uses this so
-/// Explorer's Details pane shows .lep dimensions without materializing the
-/// JPEG stream (propstore policy forbids full-fidelity conversion in-process);
-/// the unbounded [`read_info`](crate::strip::read_info) gets it too, skipping
-/// the slow full-decode fallback.
-///
-/// Returns `(height, width)` — the SOF marker stores height before width — or
-/// `None` on any malformation. Hostile files cannot panic: every slice index
-/// is bounds-checked, every declared length is capped at
-/// [`MAX_JPEG_FILE_SIZE`] (the same budget the decode tier applies), and the
-/// zlib stream is read through `Take` limits, so a deflate bomb stops at the
-/// declared header size.
-pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+/// Decompress the container's compressed header and return the embedded RAW
+/// JPEG header (SOI..SOS, SOI excluded — the lepton format stores it without
+/// the SOI). Shared by [`probe_dimensions`] and [`probe_exif`]. Hostile files
+/// cannot panic: every slice index is bounds-checked, every declared length is
+/// capped at [`MAX_JPEG_FILE_SIZE`] (the same budget the decode tier applies),
+/// and the zlib stream is read through `Take` limits, so a deflate bomb stops
+/// at the declared header size. `None` on any malformation.
+fn decompress_raw_header(bytes: &[u8]) -> Option<Vec<u8>> {
     use std::io::Read;
 
     // Fixed header (28 bytes, offsets mirror vendor/lepton_jpeg's
@@ -107,9 +100,6 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     // revision/flags + u32 jpeg_file_size + u32 compressed_header_size (both
     // little-endian). The zlib-compressed header follows at offset 28.
     const FIXED_HEADER_SIZE: usize = 28;
-    const SOI: u8 = 0xD8;
-    const SOS: u8 = 0xDA;
-    const EOI: u8 = 0xD9;
 
     let fixed = bytes.get(..FIXED_HEADER_SIZE)?;
     if !fixed.starts_with(&[0xCF, 0x84]) || fixed[2] != 1 || !matches!(fixed[3], b'Z' | b'X') {
@@ -142,6 +132,41 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if raw.len() < hdr_len {
         return None; // declared header runs past the end of the zlib stream
     }
+    Some(raw)
+}
+
+/// Camera EXIF from the container's compressed header — the camera tags live
+/// in the JPEG header's APP1 segment, which the container stores
+/// zlib-compressed along with the rest of the SOI..SOS header. Same bounded
+/// header probe as [`probe_dimensions`] (no pixel decode, no thread pool);
+/// the reconstructed stream (SOI prefix included — the EXIF reader requires
+/// it) is handed to the parser. `None` on malformation or no EXIF.
+pub(crate) fn probe_exif(bytes: &[u8]) -> Option<exif::Exif> {
+    use exif::Reader;
+    let mut raw = decompress_raw_header(bytes)?;
+    raw.insert(0, 0xFF); // SOI — the EXIF reader rejects a stream without it
+    raw.insert(1, 0xD8);
+    Reader::new()
+        .read_from_container(&mut std::io::Cursor::new(raw))
+        .ok()
+}
+
+/// Probe ONLY the container's compressed header for the embedded JPEG's
+/// dimensions — no pixel decode, no thread pool. The property handler's
+/// [`read_info_bounded`](crate::strip::read_info_bounded) path uses this so
+/// Explorer's Details pane shows .lep dimensions without materializing the
+/// JPEG stream (propstore policy forbids full-fidelity conversion in-process);
+/// the unbounded [`read_info`](crate::strip::read_info) gets it too, skipping
+/// the slow full-decode fallback.
+///
+/// Returns `(height, width)` — the SOF marker stores height before width — or
+/// `None` on any malformation.
+pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SOI: u8 = 0xD8;
+    const SOS: u8 = 0xDA;
+    const EOI: u8 = 0xD9;
+
+    let raw = decompress_raw_header(bytes)?;
 
     // Walk the JPEG segments to the first SOF0/1/2 (FF C0/C1/C2). Every index
     // is bounds-checked; a segment whose declared length is not fully present
@@ -1004,5 +1029,75 @@ mod tests {
         hdr.extend_from_slice(&6u32.to_le_bytes());
         hdr.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00]);
         assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+    }
+
+    /// The container's compressed header carries the camera's EXIF APP1 — the
+    /// probe must surface it WITHOUT decoding a pixel. Minimal TIFF in IFD0:
+    /// Make "Canon" (tag 0x010F, ASCII) and DateTimeOriginal
+    /// "2026:07:31 12:00:00" (0x9003), all offsets TIFF-relative.
+    #[test]
+    fn probe_exif_reads_camera_tags_from_container_header() {
+        let mut raw = Vec::new();
+        // APP1 segment: len 89 = 2 length bytes + 87 payload.
+        raw.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x59]);
+        raw.extend_from_slice(b"Exif\0\0");
+        raw.extend_from_slice(b"II*\0");
+        raw.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at TIFF-relative 8
+        raw.extend_from_slice(&2u16.to_le_bytes()); // two entries
+                                                    // Make (0x010F) ASCII count 5 -> value at offset 38. Lives in the
+                                                    // plain TIFF IFD0 (Context::Tiff).
+        raw.extend_from_slice(&0x010Fu16.to_le_bytes());
+        raw.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+        raw.extend_from_slice(&5u32.to_le_bytes());
+        raw.extend_from_slice(&38u32.to_le_bytes());
+        // ExifIFDPointer (0x8769) LONG -> the Exif sub-IFD at offset 44;
+        // DateTimeOriginal lives THERE (Context::Exif — kamadak's tag
+        // constants carry the context, so a bare IFD0 entry would not match
+        // Tag::DateTimeOriginal).
+        raw.extend_from_slice(&0x8769u16.to_le_bytes());
+        raw.extend_from_slice(&4u16.to_le_bytes()); // LONG
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&44u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes()); // next IFD offset
+        raw.extend_from_slice(b"Canon"); // at TIFF-relative 38
+        raw.push(0); // pad — the Exif IFD must start at TIFF-relative 44
+        raw.extend_from_slice(&1u16.to_le_bytes()); // Exif IFD: one entry
+                                                    // DateTimeOriginal (0x9003) ASCII count 19 -> value at offset 62.
+        raw.extend_from_slice(&0x9003u16.to_le_bytes());
+        raw.extend_from_slice(&2u16.to_le_bytes());
+        raw.extend_from_slice(&19u32.to_le_bytes());
+        raw.extend_from_slice(&62u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes()); // next Exif IFD offset
+        raw.extend_from_slice(b"2026:07:31 12:00:00"); // at TIFF-relative 62
+                                                       // SOF0 + SOS so the header is a parseable JPEG too.
+        raw.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00, 0xFF,
+            0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
+        ]);
+        let lep = hostile_lep(&hdr_payload(&raw, &[]));
+        let exif = probe_exif(&lep).expect("container header carries EXIF");
+
+        let make = exif.get_field(exif::Tag::Make, exif::In::PRIMARY).unwrap();
+        match &make.value {
+            exif::Value::Ascii(v) => assert_eq!(v.first().unwrap(), b"Canon"),
+            other => panic!("Make should be ASCII, got {other:?}"),
+        }
+        let dt = exif
+            .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
+            .unwrap();
+        match &dt.value {
+            exif::Value::Ascii(v) => assert_eq!(v.first().unwrap(), b"2026:07:31 12:00:00"),
+            other => panic!("DateTimeOriginal should be ASCII, got {other:?}"),
+        }
+    }
+
+    /// The committed fixture's header has no EXIF APP1 — the probe must return
+    /// None, not decode, and never panic.
+    #[test]
+    fn probe_exif_none_without_exif_segment() {
+        let lep = include_bytes!("../../tests/fixtures/lepton.lep");
+        assert!(probe_exif(lep).is_none());
+        // Hostile garbage still decompresses-guarded: None, no panic.
+        assert!(probe_exif(&[0xCF, 0x84, 0x01, b'Z', 0, 0, 0, 0]).is_none());
     }
 }
