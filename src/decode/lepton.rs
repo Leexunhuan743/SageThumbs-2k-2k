@@ -148,8 +148,7 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
             // SOS / EOI before any SOF: no usable dimensions in this header.
             SOS | EOI => return None,
             _ => {
-                let seg_len =
-                    u16::from_be_bytes(raw.get(i + 2..i + 4)?.try_into().ok()?) as usize;
+                let seg_len = u16::from_be_bytes(raw.get(i + 2..i + 4)?.try_into().ok()?) as usize;
                 if seg_len < 2 {
                     return None;
                 }
@@ -759,8 +758,8 @@ mod tests {
         hdr.extend_from_slice(&33u32.to_le_bytes());
         hdr.extend_from_slice(&[
             0xFF, 0xE0, 0x00, 0x12, // APP0, len 18 (2 length bytes + 16 payload)
-            b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
-            0x00, 0x00, 0x00, // 16-byte APP0 payload
+            b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, // 16-byte APP0 payload
             0xFF, 0xC0, 0x00, 0x0B, // SOF0, len 11
             0x08, // precision 8
             0x01, 0xE0, 0x02, 0x80, // height 480, width 640

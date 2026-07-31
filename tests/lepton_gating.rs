@@ -47,7 +47,10 @@ fn lep_is_registered_with_lepton_display_name() {
         .iter()
         .find(|(ext, _)| ext.eq_ignore_ascii_case("lep"))
         .expect("FORMATS must contain a .lep entry");
-    assert_eq!(entry.0, "lep", "the registered extension should be lowercase");
+    assert_eq!(
+        entry.0, "lep",
+        "the registered extension should be lowercase"
+    );
     assert!(
         entry.1.contains("Lepton"),
         "display name {:?} should mention Lepton",
@@ -58,7 +61,10 @@ fn lep_is_registered_with_lepton_display_name() {
 #[test]
 fn lep_passes_the_verb_image_gate() {
     assert!(verb_image_gate("photo.lep"));
-    assert!(verb_image_gate("photo.LEP"), "gate must be case-insensitive");
+    assert!(
+        verb_image_gate("photo.LEP"),
+        "gate must be case-insensitive"
+    );
     // A non-format extension is not an image.
     assert!(!verb_image_gate("photo.xyz"));
     // A known-but-archive extension is excluded by the same gate (.zip is in
