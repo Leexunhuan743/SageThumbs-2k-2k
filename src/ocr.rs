@@ -1,6 +1,8 @@
 //! OCR an image → text → clipboard, via the in-box WinRT `Windows.Media.Ocr`
-//! engine. Zero bundled bytes (Windows ships the recognizer). Decoding is done by
-//! the OS `BitmapDecoder`, so any format Windows can open works.
+//! engine. Zero bundled bytes (Windows ships the recognizer). File inputs are
+//! decoded by our own tiered decoder first ([`decode_to_png`]) because the
+//! engine's `BitmapDecoder` only opens WIC formats — handed raw .lep (or any
+//! other non-WIC file) bytes, it always fails.
 //!
 //! Runs on a dedicated MTA thread and blocks the WinRT async via `pdf::block_op`
 //! (same pattern as the PDF thumbnailer — windows-future's `.join()` is private).
@@ -21,11 +23,28 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 use crate::pdf::block_op;
 use crate::verbs::read_capped;
 
+/// Decode any supported image file (incl. .lep) to PNG bytes for the
+/// recognizer. The WinRT `BitmapDecoder` inside [`recognize_bytes`] only opens
+/// WIC formats, so raw file bytes from a non-WIC format (.lep, PSD, …) would
+/// always fail there; this runs the file through our own tiered decoder
+/// (`crate::decode::decode_full` — the same full-fidelity path the companion
+/// app's Quick-preview OCR uses, see `src/bin/app/ocr_result.rs` `to_png`) and
+/// re-encodes the result as PNG. Applies the same shared input cap
+/// ([`read_capped`]) as every other file-reading verb.
+pub(crate) fn decode_to_png(path: &str) -> Result<Vec<u8>> {
+    let bytes = read_capped(path)?;
+    let img = crate::decode::decode_full(&bytes)?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|_| Error::from(E_FAIL))?;
+    Ok(png)
+}
+
 /// Recognize text in the image at `path` and put it on the clipboard. Errors
 /// (no text found, no OCR language pack, unreadable image) leave the clipboard
 /// untouched.
 pub fn ocr_to_clipboard(path: &str) -> Result<()> {
-    let text = recognize_bytes(read_capped(path)?)?;
+    let text = recognize_bytes(decode_to_png(path)?)?;
     if text.trim().is_empty() {
         return Err(Error::from(E_FAIL));
     }
@@ -48,8 +67,11 @@ const OCR_TIMEOUT: Duration = Duration::from_secs(30);
 pub const OCR_IMAGE_TOO_LARGE: windows::core::HRESULT =
     windows::core::HRESULT(0x8898_2F05u32 as i32);
 
-/// Recognize text in image `bytes` (used by `ocr_to_clipboard`, the screen-capture OCR in the
-/// companion app, the `st2k ocr` CLI, and the test hook). Runs on a fresh MTA thread — blocking
+/// Recognize text in `bytes` — a DECODED image (PNG/JPEG/…), not raw file
+/// bytes: the engine's `BitmapDecoder` only opens WIC formats, so .lep and
+/// every other non-WIC file must go through [`decode_to_png`] first. Used by
+/// `ocr_to_clipboard`, the screen-capture OCR in the companion app, the
+/// `st2k ocr` CLI, and the test hook. Runs on a fresh MTA thread — blocking
 /// `.get()`-style waits can deadlock in an STA and we can't assume the caller's apartment.
 ///
 /// Takes the buffer BY VALUE and moves it onto that worker: every caller already owns a `Vec`
@@ -262,6 +284,21 @@ mod tests {
                 "{w}x{h} scaled {f}x exceeds the engine limit {max}"
             );
         }
+    }
+
+    /// The decode-to-PNG helper must work on .lep with NO OCR engine involved:
+    /// read → `decode_full` (lepton tier) → PNG is pure decode. The fixture is
+    /// the same committed 640x480 one the decode tier's own test consumes.
+    #[test]
+    fn decode_to_png_handles_lepton_fixture() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lepton.lep");
+        let png = decode_to_png(path).expect("lepton fixture must decode to PNG");
+        assert!(
+            png.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            "output must start with the PNG magic"
+        );
+        let img = image::load_from_memory(&png).expect("output must be a valid PNG");
+        assert_eq!((img.width(), img.height()), (640, 480));
     }
 
     /// Degenerate input must not divide by zero or return a zero factor (which would ask WIC

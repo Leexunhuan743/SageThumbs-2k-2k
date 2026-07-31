@@ -328,7 +328,7 @@ fn decode_any_with_wic_target(
 
 mod color;
 mod exrscale;
-mod lepton;
+pub(crate) mod lepton;
 mod magick;
 pub(crate) use magick::looks_like_metafile;
 #[cfg(test)]

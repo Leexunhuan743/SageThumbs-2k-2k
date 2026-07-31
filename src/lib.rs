@@ -141,7 +141,7 @@ pub fn render_preview_png(path: &str, out_png: &str, bg: Option<u32>) -> bool {
 /// text" verb uses, minus the clipboard write). None if no OCR pack / no text.
 #[doc(hidden)]
 pub fn ocr_probe(path: &str) -> Option<String> {
-    ocr::recognize_bytes(std::fs::read(path).ok()?)
+    ocr::recognize_bytes(ocr::decode_to_png(path).ok()?)
         .ok()
         .filter(|t| !t.trim().is_empty())
 }
