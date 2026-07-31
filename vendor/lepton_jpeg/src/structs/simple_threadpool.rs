@@ -132,102 +132,119 @@ impl SimpleThreadPool {
 
     /// Spawns one worker thread that runs `f` and then parks in the idle list.
     fn spawn_worker(&self, f: Box<dyn FnOnce() + Send + 'static>) {
-            // channel for receiving future work on this thread
-            let (tx_schedule, rx_schedule): (
-                std::sync::mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
-                std::sync::mpsc::Receiver<Box<dyn FnOnce() + Send + 'static>>,
-            ) = channel();
+        // channel for receiving future work on this thread
+        let (tx_schedule, rx_schedule): (
+            std::sync::mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
+            std::sync::mpsc::Receiver<Box<dyn FnOnce() + Send + 'static>>,
+        ) = channel();
 
-            let priority = self.priority;
-            // SAGETHUMBS PATCH (0.5.8): workers hold a WEAK reference to the idle
-            // list instead of a strong Arc. Upstream's strong clone keeps the
-            // `Mutex<Vec<Sender>>` alive as long as a worker lives, so a per-call
-            // pool's channels never close when the pool is dropped: workers park on
-            // `recv()` forever and every decode leaks 1-2 threads inside dllhost/
-            // explorer. With a Weak, dropping the pool drops the last strong Arc,
-            // which drops the Vec and every Sender clone. Each worker's own
-            // captured Sender keeps its channel open, so the worker cannot observe
-            // Disconnected — it exits via the 250 ms liveness probe below (recv
-            // timeout + failed Weak upgrade). The process-global
-            // `DEFAULT_THREAD_POOL` is unaffected (it is never dropped, so its
-            // Weak never expires and its workers keep being reused).
-            let idle_threads = Arc::downgrade(&self.idle_threads);
+        let priority = self.priority;
+        // SAGETHUMBS PATCH (0.5.8): only per-call pools feed the
+        // test-only liveness counter. DEFAULT_THREAD_POOL's workers are
+        // permanent and may be spawned concurrently by any other test's
+        // execute — counting them made the exit assertions in the
+        // per-call regression tests race with unrelated tests (a late
+        // DEFAULT spawn after the baseline snapshot broke
+        // `ACTIVE == before`). DEFAULT workers are never dropped, so
+        // their liveness is irrelevant to the leak check. Computed
+        // OUTSIDE the worker closure (a &self borrow cannot escape into
+        // the 'static thread).
+        #[cfg(test)]
+        let count_liveness = !std::ptr::eq(self, &DEFAULT_THREAD_POOL);
+        // SAGETHUMBS PATCH (0.5.8): workers hold a WEAK reference to the idle
+        // list instead of a strong Arc. Upstream's strong clone keeps the
+        // `Mutex<Vec<Sender>>` alive as long as a worker lives, so a per-call
+        // pool's channels never close when the pool is dropped: workers park on
+        // `recv()` forever and every decode leaks 1-2 threads inside dllhost/
+        // explorer. With a Weak, dropping the pool drops the last strong Arc,
+        // which drops the Vec and every Sender clone. Each worker's own
+        // captured Sender keeps its channel open, so the worker cannot observe
+        // Disconnected — it exits via the 250 ms liveness probe below (recv
+        // timeout + failed Weak upgrade). The process-global
+        // `DEFAULT_THREAD_POOL` is unaffected (it is never dropped, so its
+        // Weak never expires and its workers keep being reused).
+        let idle_threads = Arc::downgrade(&self.idle_threads);
 
-            spawn(move || {
-                #[cfg(test)]
+        spawn(move || {
+            #[cfg(test)]
+            if count_liveness {
                 ACTIVE_WORKERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
 
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
-                match priority {
-                    LeptonThreadPriority::Low => thread_priority::set_current_thread_priority(
-                        thread_priority::ThreadPriority::Min,
-                    )
-                    .unwrap(),
-                    LeptonThreadPriority::Normal => {}
-                    LeptonThreadPriority::High => thread_priority::set_current_thread_priority(
-                        thread_priority::ThreadPriority::Max,
-                    )
-                    .unwrap(),
-                }
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            match priority {
+                LeptonThreadPriority::Low => thread_priority::set_current_thread_priority(
+                    thread_priority::ThreadPriority::Min,
+                )
+                .unwrap(),
+                LeptonThreadPriority::Normal => {}
+                LeptonThreadPriority::High => thread_priority::set_current_thread_priority(
+                    thread_priority::ThreadPriority::Max,
+                )
+                .unwrap(),
+            }
 
-                f();
+            f();
 
-                loop {
-                    // Park in the idle list: exactly one push per completed task
-                    // (the submitter pops this entry before waking us again).
-                    let Some(pool) = idle_threads.upgrade() else {
+            loop {
+                // Park in the idle list: exactly one push per completed task
+                // (the submitter pops this entry before waking us again).
+                let Some(pool) = idle_threads.upgrade() else {
+                    break;
+                };
+                if let Ok(mut i) = pool.lock() {
+                    // stick back into list of idle threads if there aren't more than
+                    // the number of cpus already there.
+                    if i.len() > *NUM_CPUS {
+                        // just exits the thread
                         break;
-                    };
-                    if let Ok(mut i) = pool.lock() {
-                        // stick back into list of idle threads if there aren't more than
-                        // the number of cpus already there.
-                        if i.len() > *NUM_CPUS {
-                            // just exits the thread
+                    }
+                    i.push(tx_schedule.clone());
+                    drop(i);
+                } else {
+                    break;
+                }
+                // SAGETHUMBS PATCH (0.5.8): release the upgraded Arc BEFORE
+                // parking — otherwise the worker holds a strong reference while
+                // waiting, and dropping the pool cannot free the idle list (and
+                // the worker's channel) until the next liveness probe wakes it.
+                drop(pool);
+
+                // Wait for a task. The 250 ms timeout is a liveness probe: if the
+                // owning pool was dropped while we were parked, our own captured
+                // Sender keeps the channel open (so recv never returns
+                // Disconnected) — the upgrade check is the only exit.
+                loop {
+                    match rx_schedule.recv_timeout(Duration::from_millis(250)) {
+                        Ok(f) => {
+                            f();
                             break;
                         }
-                        i.push(tx_schedule.clone());
-                        drop(i);
-                    } else {
-                        break;
-                    }
-                    // SAGETHUMBS PATCH (0.5.8): release the upgraded Arc BEFORE
-                    // parking — otherwise the worker holds a strong reference while
-                    // waiting, and dropping the pool cannot free the idle list (and
-                    // the worker's channel) until the next liveness probe wakes it.
-                    drop(pool);
-
-                    // Wait for a task. The 250 ms timeout is a liveness probe: if the
-                    // owning pool was dropped while we were parked, our own captured
-                    // Sender keeps the channel open (so recv never returns
-                    // Disconnected) — the upgrade check is the only exit.
-                    loop {
-                        match rx_schedule.recv_timeout(Duration::from_millis(250)) {
-                            Ok(f) => {
-                                f();
+                        Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            // SAGETHUMBS PATCH (0.5.8): re-check pool liveness
+                            // ONLY — never re-push the Sender from here. Each
+                            // wake-up would duplicate the idle-list entry, and a
+                            // worker later evicted by the NUM_CPUS cap would
+                            // leave a stale Sender behind (send → SendError
+                            // panic on the next submit). A failed upgrade means
+                            // the owning pool was dropped: exit via the outer
+                            // loop's upgrade check.
+                            if idle_threads.upgrade().is_none() {
                                 break;
-                            }
-                            Err(RecvTimeoutError::Disconnected) => break,
-                            Err(RecvTimeoutError::Timeout) => {
-                                // SAGETHUMBS PATCH (0.5.8): re-check pool liveness
-                                // ONLY — never re-push the Sender from here. Each
-                                // wake-up would duplicate the idle-list entry, and a
-                                // worker later evicted by the NUM_CPUS cap would
-                                // leave a stale Sender behind (send → SendError
-                                // panic on the next submit). A failed upgrade means
-                                // the owning pool was dropped: exit via the outer
-                                // loop's upgrade check.
-                                if idle_threads.upgrade().is_none() {
-                                    break;
-                                }
                             }
                         }
                     }
                 }
-                // SAGETHUMBS PATCH (0.5.8): single exit point — decrement the
-                // test-only liveness counter (cfg(test) strips this in release).
-                #[cfg(test)]
+            }
+            // SAGETHUMBS PATCH (0.5.8): single exit point — decrement the
+            // test-only liveness counter (cfg(test) strips this in release).
+            // Same DEFAULT_THREAD_POOL exclusion as the increment above.
+            #[cfg(test)]
+            if count_liveness {
                 ACTIVE_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            });
+            }
+        });
     }
 }
 
@@ -303,7 +320,10 @@ fn pool_drop_releases_idle_list() {
         thread::yield_now();
     }
     assert!(pool.get_idle_threads() > 0, "workers should have parked");
-    assert!(weak.upgrade().is_some(), "idle list alive while pool is alive");
+    assert!(
+        weak.upgrade().is_some(),
+        "idle list alive while pool is alive"
+    );
 
     drop(pool);
 
@@ -329,7 +349,12 @@ fn per_call_pool_workers_exit_on_drop() {
     use std::time::{Duration, Instant};
 
     let _lock = POOL_TEST_LOCK.lock().unwrap();
+    // Only per-call pools feed ACTIVE_WORKERS (see spawn_worker), so the
+    // baseline is stable even while other tests execute on DEFAULT_THREAD_POOL.
     let before = ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst);
+    // A per-call pool spawns up to NUM_CPUS workers; on a 1-CPU machine the
+    // second run() reuses the only worker, so assert for min(2, NUM_CPUS).
+    let expected_workers = NUM_CPUS.min(2);
     {
         let pool = SimpleThreadPool::new(LeptonThreadPriority::Normal);
         pool.run(Box::new(|| {}));
@@ -337,24 +362,24 @@ fn per_call_pool_workers_exit_on_drop() {
 
         // Both workers must come alive...
         let deadline = Instant::now() + Duration::from_secs(5);
-        while ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) < before + 2
+        while ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) < before + expected_workers
             && Instant::now() < deadline
         {
             thread::yield_now();
         }
         assert!(
-            ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) >= before + 2,
-            "two workers should be alive while the pool is alive"
+            ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) >= before + expected_workers,
+            "{expected_workers} worker(s) should be alive while the pool is alive"
         );
 
-        // ...and both must park in the idle list before we drop the pool.
+        // ...and all must park in the idle list before we drop the pool.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while pool.get_idle_threads() < 2 && Instant::now() < deadline {
+        while pool.get_idle_threads() < expected_workers && Instant::now() < deadline {
             thread::yield_now();
         }
         assert!(
-            pool.get_idle_threads() >= 2,
-            "both workers should have parked"
+            pool.get_idle_threads() >= expected_workers,
+            "all workers should have parked"
         );
     }
 

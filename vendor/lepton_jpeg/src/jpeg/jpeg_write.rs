@@ -323,7 +323,8 @@ fn recode_one_mcu_row(
                 // or corrupt header); indexing it with the unbounded scan counter
                 // panics in ALL builds. A missing entry means "no injected
                 // restarts for this scan" (the pre-DRI fallback).
-                let rst_count_for_scan = rinfo.rst_cnt.get(current_scan_index).copied().unwrap_or(0);
+                let rst_count_for_scan =
+                    rinfo.rst_cnt.get(current_scan_index).copied().unwrap_or(0);
                 if rinfo.rst_cnt.len() == 0
                     || (!rinfo.rst_cnt_set)
                     || cumulative_reset_markers < rst_count_for_scan
@@ -520,6 +521,18 @@ fn encode_ac_prg_sa(
         while bpos >= from {
             if (block[usize::from(bpos)] == 1) || (block[usize::from(bpos)] == -1) {
                 eob = bpos + 1;
+                break;
+            }
+            // SAGETHUMBS PATCH (0.5.8): `bpos` is a u8 walking DOWN; with a
+            // hostile SOS declaring cs_from == 0 and a block with no ±1
+            // coefficient (an all-zero block is a valid hostile decode), the
+            // upstream `bpos -= 1` underflowed past 0: overflow panic in
+            // debug, and in RELEASE a wrap to 255 that indexed block[255] of
+            // a [i16; 64] — an index-OOB abort in ALL builds on the main
+            // thread (process_progressive -> jpeg_write_entire_scan, no
+            // catch_unwind). The C++ reference uses a signed int and exits at
+            // -1; stopping at 0 is the equivalent scan.
+            if bpos == 0 {
                 break;
             }
             bpos -= 1;
@@ -886,6 +899,49 @@ mod tests {
         for _ in 0..10 {
             f();
         }
+    }
+
+    /// SAGETHUMBS PATCH 12 discriminator: the eob scan in `encode_ac_prg_sa`
+    /// walks `bpos: u8` DOWN from `to`. With `from == 0` (a hostile SOS
+    /// declaring Ss=0/Se>=1 — the decode-side header accepts it; only the
+    /// encode side rejects from==0) and a block with NO ±1 coefficient (an
+    /// all-zero block is a valid hostile decode), the upstream loop
+    /// `while bpos >= from { ... bpos -= 1; }` underflowed past 0: overflow
+    /// panic in debug, and in RELEASE a wrap to 255 that indexed `block[255]`
+    /// of a [i16; 64] — an index-OOB abort in ALL builds on the main thread
+    /// (process_progressive -> jpeg_write_entire_scan, no catch_unwind). The
+    /// C++ reference uses a signed int and exits at -1. Patched: stop at 0
+    /// (equivalent scan). Must return Ok with eob staying at `from`.
+    #[test]
+    fn encode_ac_prg_sa_from_zero_all_zero_block_does_not_underflow() {
+        let mut huffw = BitWriter::new(Vec::new());
+        let actbl = HuffCodes::default();
+        // Minimal header so `JpegPositionState::new` cannot overflow on the
+        // default u32::MAX sampling sentinels; only `state.eobrun` is touched
+        // on this path.
+        let mut jf = JpegHeader::default();
+        jf.cs_cmp[0] = 0;
+        jf.cmp_info[0].sfv = 1;
+        jf.cmp_info[0].sfh = 1;
+        let mut state = JpegPositionState::new(&jf, 0);
+        let mut correction_bits = Vec::new();
+        let block = [0i16; 64];
+        // Unpatched: debug panic (subtract overflow) / release index-OOB.
+        let r = encode_ac_prg_sa(
+            &mut huffw,
+            &actbl,
+            &block,
+            &mut state,
+            0, // from — hostile SOS Ss=0
+            63,
+            &mut correction_bits,
+        );
+        // Patched: the scan terminates at bpos 0 and the function returns a
+        // clean error (the default table has no EOB symbol) instead of panicking.
+        assert!(
+            r.is_err(),
+            "eob scan over an all-zero block with from=0 must return a clean error, never panic"
+        );
     }
 }
 

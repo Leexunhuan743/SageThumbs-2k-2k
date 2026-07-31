@@ -86,6 +86,18 @@ impl LeptonHeader {
         // flags to detect the SIMD flavor that was used to encode, since
         // previously the encoder would generate different incompatible files depending on
         // whether SIMD or scalar was selected by the build options.
+        //
+        // KNOWN COLLISION (SAGETHUMBS audit note): C++-encoded files store 12 raw
+        // bytes of `git rev-parse HEAD` here (jpgcoder.cc:4056-4062), so a C++
+        // build whose SHA starts with hex 4d53 is misparsed as MS-format, with
+        // flags = revision byte 6 and encoder_version = revision byte 7
+        // (observed instance: microsoft/lepton_jpeg_rust's own
+        // images/eof_and_trailingrst.lep has bytes 8..10 = 4d 53 — benign there,
+        // because those particular SHA bytes are 0). Probability ~1/131072 per
+        // C++ file; a byte 14 with 0x80 set flips the probability model and a
+        // byte 15 == 55 changes truncation handling. Not fixable without a
+        // stronger discriminator (the space is overloaded by design); accepted
+        // as a documented risk for C++-produced files.
         if header[8] == 'M' as u8 && header[9] == 'S' as u8 {
             self.uncompressed_lepton_header_size =
                 Some(u32::from_le_bytes(header[10..14].try_into().unwrap()));
@@ -208,8 +220,7 @@ impl LeptonHeader {
             if self.thread_handoff[i].luma_y_start > self.thread_handoff[i].luma_y_end {
                 return err_exit_code(ExitCode::BadLeptonFile, "inverted thread luma range");
             }
-            if i > 0
-                && self.thread_handoff[i].luma_y_start != self.thread_handoff[i - 1].luma_y_end
+            if i > 0 && self.thread_handoff[i].luma_y_start != self.thread_handoff[i - 1].luma_y_end
             {
                 return err_exit_code(ExitCode::BadLeptonFile, "non-contiguous thread luma ranges");
             }
@@ -219,6 +230,29 @@ impl LeptonHeader {
                 ExitCode::BadLeptonFile,
                 "first thread luma range must start at row 0",
             );
+        }
+
+        // SAGETHUMBS PATCH (0.5.8): thread boundaries must also lie on the
+        // MCU-row grid. RowSpec::get_row_spec_from_index emits luma_y values
+        // that are multiples of component_multiple[0] = bcv[0]/mcuv, and each
+        // decode thread consumes WHOLE MCU rows; a boundary between two grid
+        // points makes the thread's BlockBasedImage capacity (computed from
+        // (end-start)/bcv[0]) smaller than the blocks the MCU row emits,
+        // tripping append_block's capacity assert on a worker — a PANIC in
+        // release (panic=abort) inside the shell host. Legit encoders always
+        // split on MCU rows (C++ crystallize_thread_handoff uses mcu/mcuh
+        // grid rows), so off-grid boundaries are rejected cleanly. The
+        // check is trivial when the grid is 1 (no vertical subsampling).
+        let luma_rows_per_mcu = self.jpeg_header.cmp_info[0].bcv / self.jpeg_header.mcuv.get();
+        if luma_rows_per_mcu > 1 {
+            for i in 0..num_threads {
+                if self.thread_handoff[i].luma_y_start % luma_rows_per_mcu != 0 {
+                    return err_exit_code(
+                        ExitCode::BadLeptonFile,
+                        "thread luma range not MCU-row aligned",
+                    );
+                }
+            }
         }
 
         // if the last segment was too big to fit with the garbage data taken into account, shorten it
@@ -296,7 +330,17 @@ impl LeptonHeader {
             Ok(n)
         };
 
-        let mut header_reader = ZlibDecoder::new(src);
+        // SAGETHUMBS PATCH (0.5.8): bound the TOTAL decompressed header
+        // stream at the same max_jpeg_file_size budget every length field is
+        // capped at. Without this, a deflate bomb (compressed input bounded
+        // only by compressed_header_size, stored blocks expand ~13107x) could
+        // grow the recovery-marker section to GiB across many markers — an
+        // OOM abort in the shell host. take() exhaustion surfaces as
+        // UnexpectedEof, which the marker loop treats as stream end, so the
+        // limit() check after the loop turns "budget hit" into a clean error
+        // instead of silently accepting a truncated header.
+        let mut header_reader =
+            ZlibDecoder::new(src).take(u64::from(enabled_features.max_jpeg_file_size));
 
         let mut hdr_buf: [u8; 3] = [0; 3];
         header_reader.read_exact(&mut hdr_buf)?;
@@ -350,7 +394,17 @@ impl LeptonHeader {
                 // decompress to GiB of rst_count entries, growing rst_cnt
                 // unboundedly -> OOM abort in the shell host. Legit files carry
                 // one small entry per scan, so the cap cannot reject valid files.
-                let rst_count = cap(header_reader.read_u32::<LittleEndian>()? as usize)?;
+                // The count is u32 ENTRIES (4 bytes each): cap it at the byte
+                // budget / 4 so the rst_cnt Vec stays within max_jpeg_file_size
+                // bytes, consistent with every other allocation here (the
+                // original per-marker cap alone still allowed a 512 MiB Vec).
+                let rst_count = header_reader.read_u32::<LittleEndian>()? as usize;
+                if rst_count > enabled_features.max_jpeg_file_size as usize / 4 {
+                    return err_exit_code(
+                        ExitCode::BadLeptonFile,
+                        "CRS entry count exceeds max_jpeg_file_size",
+                    );
+                }
 
                 for _i in 0..rst_count {
                     self.rinfo
@@ -413,7 +467,25 @@ impl LeptonHeader {
         // shouldn't be any more data
         let mut remaining_buf = Vec::new();
         let remaining = header_reader.read_to_end(&mut remaining_buf)?;
-        assert!(remaining == 0);
+        // SAGETHUMBS PATCH (0.5.8): upstream asserted `remaining == 0` here — a
+        // PANIC in ALL builds, reachable on the header-parse main thread (no
+        // catch_unwind) when the stream ends with 1-2 bytes after the last
+        // marker (the 3-byte marker-prefix read breaks on UnexpectedEof
+        // first). Also distinguish the take() budget running out from a clean
+        // zlib EOF: budget exhaustion means a header truncated mid-marker was
+        // silently accepted. Both become clean BadLeptonFile errors.
+        if header_reader.limit() == 0 {
+            return err_exit_code(
+                ExitCode::BadLeptonFile,
+                "decompressed lepton header exceeds max_jpeg_file_size",
+            );
+        }
+        if remaining != 0 {
+            return err_exit_code(
+                ExitCode::BadLeptonFile,
+                "trailing data after lepton header markers",
+            );
+        }
 
         return Ok(hdr_data);
     }

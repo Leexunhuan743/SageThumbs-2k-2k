@@ -46,8 +46,7 @@ impl BlockBasedImage {
             // luma_y_end < luma_y_start (upstream plain `-` underflowed u32 →
             // panic in debug, huge wrap in release). Defense-in-depth behind the
             // header range validation: saturate to 0 → clean OOM-free allocation.
-            (u64::from(max_size)
-                * u64::from(luma_y_end.saturating_sub(luma_y_start))
+            (u64::from(max_size) * u64::from(luma_y_end.saturating_sub(luma_y_start))
                 + u64::from(jpeg_header.cmp_info[0].bcv - 1 /* round up */))
                 / u64::from(jpeg_header.cmp_info[0].bcv),
         )
@@ -103,10 +102,29 @@ impl BlockBasedImage {
         let mut original_height = None;
 
         for v in images {
-            assert!(
-                v[index].dpos_offset == contents.len() as u32,
-                "previous content should match new content"
-            );
+            // SAGETHUMBS PATCH (0.5.8): upstream ASSERTED
+            // `dpos_offset == contents.len()` here — a PANIC in ALL builds,
+            // reachable on the MAIN thread for progressive files (process_
+            // progressive, no catch_unwind) from a hostile EEE truncation:
+            // max_dpos cutting through a middle thread partition makes the
+            // truncation gate stop that partition short, so the next
+            // partition's dpos_offset no longer matches the accumulated
+            // contents — a process abort in the shell host. The C++ reference
+            // has no such assert (its reads clamp dpos to trunc_bc-1), but
+            // the Rust JPEG writers index the merged image by the full-height
+            // layout, so a short partition cannot be tolerated without a fill
+            // pass. Clean error instead: the caller reports the file as
+            // undecodable rather than aborting.
+            if v[index].dpos_offset != contents.len() as u32 {
+                return err_exit_code(
+                    ExitCode::BadLeptonFile,
+                    format!(
+                        "block image merge mismatch: partition starts at block {}, {} blocks accumulated",
+                        v[index].dpos_offset,
+                        contents.len()
+                    ),
+                );
+            }
 
             if let Some(w) = block_width {
                 assert_eq!(w, v[index].block_width, "all block_width must match")
@@ -360,5 +378,48 @@ impl AlignedBlock {
             self.raw_data[offset + (6 * stride)],
             self.raw_data[offset + (7 * stride)],
         ]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jpeg::jpeg_header::JpegHeader;
+
+    /// PATCH 14 discriminator (merge contiguity): a thread partition whose
+    /// blocks were cut short by the EEE truncation gate (`decode_row_wrapper`
+    /// stops at `component_size_in_blocks`) leaves the NEXT partition's
+    /// `dpos_offset` unequal to the accumulated contents length. Upstream
+    /// ASSERTED this in merge — a PANIC in ALL builds, reachable on the MAIN
+    /// thread for progressive files (process_progressive, no catch_unwind) —
+    /// i.e. a process abort inside the shell host. The C++ reference has no
+    /// such assert (its reads clamp dpos to trunc_bc-1), but the Rust JPEG
+    /// writers index the merged image by the full-height layout, so a short
+    /// partition cannot be tolerated without a fill pass. Patched: a clean
+    /// error, never a panic.
+    #[test]
+    fn merge_with_gate_truncated_partition_is_clean_error() {
+        // 1-component header: bch=2, bcv=8 (a 2x2-sampled 64-row image).
+        let mut jf = JpegHeader::default();
+        jf.cmpc = 1;
+        jf.cmp_info[0].bch = 2;
+        jf.cmp_info[0].bcv = 8;
+        jf.cmp_info[0].bc = 16; // bch * bcv
+        jf.cmp_info[0].sfh = 1;
+        jf.cmp_info[0].sfv = 1;
+
+        // Thread 0 covers [0, 2): dpos_offset = 16*2/8 = 4 for the NEXT
+        // partition. Simulate the truncation gate cutting it to ONE block.
+        let mut img0 = BlockBasedImage::new(&jf, 0, 0, 2).unwrap();
+        img0.append_block(AlignedBlock { raw_data: [0; 64] });
+        // Thread 1 [2, 2): empty tail partition, dpos_offset = 4.
+        let img1 = BlockBasedImage::new(&jf, 0, 2, 2).unwrap();
+
+        // Unpatched: assert panic (`4 != 1`). Patched: clean error.
+        let r = BlockBasedImage::merge(&mut vec![vec![img0], vec![img1]], 0);
+        assert!(
+            r.is_err(),
+            "merge must reject a gate-truncated partition as a clean error"
+        );
     }
 }
