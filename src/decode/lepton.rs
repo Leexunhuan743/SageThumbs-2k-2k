@@ -74,11 +74,20 @@ pub(super) fn decode_lepton(bytes: &[u8]) -> Result<DynamicImage> {
         crate::safety::log_debug(&format!("lepton decode error: {e:?}"));
         Error::from(E_FAIL)
     })?;
-    // The same guard set as the jxl / raw-preview tiers: image crate + MAX_DIM /
-    // MAX_ALLOC limits + CMYK handling + ICC→sRGB (jxl decodes via jxl_oxide
-    // with an equivalent limits block, not through this entry). `jpeg` is
-    // ≤ 128 MiB by the cap above, so the allocation is bounded before this call.
-    super::decode_with_image(&jpeg)
+    // The same entry the jxl / raw-preview tiers end at: image crate + MAX_DIM /
+    // MAX_ALLOC limits + CMYK handling + ICC→sRGB. `jpeg` is ≤ 128 MiB by the cap
+    // above, so the allocation is bounded before this call.
+    //
+    // EXIF orientation: lepton is bit-exact, so the reconstructed JPEG carries the
+    // camera's original orientation tags — apply them here, exactly once. The
+    // outer `decode_image_with_raw_order` wrapper re-applies orientation from the
+    // ORIGINAL container bytes, where the 0xCF 0x84 magic fails `has_exif_container`
+    // and is a no-op; applying from the reconstructed JPEG here (like the
+    // embedded-thumbnail path in thumb.rs) is the only active application.
+    Ok(apply_exif_orientation(
+        super::decode_with_image(&jpeg)?,
+        &jpeg,
+    ))
 }
 
 /// Decompress the container's compressed header and return the embedded RAW
@@ -535,7 +544,7 @@ mod tests {
         assert!(decode_lepton(&hostile_lep(&hdr3)).is_err());
     }
 
-    /// P0 regression for patch 10 (EEE `max_dpos + 1` overflow): the EEE
+    /// P0 regression for patch 11 (EEE `max_dpos + 1` overflow): the EEE
     /// marker's max_dpos fields are hostile u32s with no validation, and
     /// `u32::MAX` used to overflow in `set_truncation_bounds` (reproduced:
     /// "attempt to add with overflow" at truncate_components.rs:69 in
@@ -561,9 +570,65 @@ mod tests {
     fn lepton_early_eof_size_arithmetic_is_bounded() {
         let (raw, markers) = real_header_parts();
         let payload = hdr_payload(&raw, &[&eee_marker(0)[..], &markers[..]].concat());
-        // 64 < real header (~110 bytes) + EOI garbage (2) + SOI (2): underflows
+        // 64 < real header (621 bytes) + EOI garbage (2) + SOI (2): underflows
         // without the patch; clamps to an empty decode with it.
         assert!(decode_lepton(&hostile_lep_full(&payload, 64)).is_err());
+    }
+
+    /// Deterministic discriminator for SAGETHUMBS PATCH 1 (early_eof size
+    /// arithmetic). The hostile_lep fixed prefix declares jpeg_file_size = 64;
+    /// this header adds an EEE (early-EOF) marker plus a GRB garbage blob of 64
+    /// bytes, so in `read_compressed_lepton_header` the early_eof branch computes
+    /// `jpeg_file_size - garbage(64) - raw_jpeg_header_read_index(92) - SOI(2)`:
+    /// unpatched, that plain `-` chain UNDERFLOWS u32 (panic in every
+    /// overflow-checked build — the gold-legacy.lep P0); patched, saturating_sub
+    /// clamps to 0 and the zero-size segment makes the body decode fail cleanly.
+    #[test]
+    fn lepton_early_eof_with_tiny_file_size_is_clean_error() {
+        // Raw JPEG header (no SOI — the format stores the header without it):
+        // SOF0 64x64 / 1 component, DQT with a non-zero table 0
+        // (JpegHeader::parse rejects q_tables[..][0] == 0), SOS. 13+69+10 = 92
+        // bytes consumed by the parse gate, which is what drives the underflow.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, // SOF0, len 11
+            0x08, // precision 8
+            0x00, 0x40, 0x00, 0x40, // 64x64
+            0x01, 0x01, 0x11, 0x00, // 1 component, 1x1 sampling, qt 0
+        ]);
+        raw.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]); // DQT, len 67, table 0
+        raw.extend_from_slice(&[1; 64]); // non-zero quantization values
+        raw.extend_from_slice(&[
+            0xFF, 0xDA, 0x00, 0x08, // SOS, len 8
+            0x01, // 1 component in scan
+            0x01, 0x00, // comp 1, huff_dc 0 / huff_ac 0
+            0x00, 0x3F, 0x00, // Ss 0, Se 63, Ah/Al 0
+        ]);
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(&raw);
+        // EEE marker: max_cmp, max_bpos, max_sah, max_dpos[0..4] (all 0).
+        hdr.extend_from_slice(b"EEE");
+        for _ in 0..7 {
+            hdr.extend_from_slice(&0u32.to_le_bytes());
+        }
+        // HH: one thread (passes the zero-handoff guard), zero-size segment.
+        hdr.extend_from_slice(b"HH");
+        hdr.push(1);
+        hdr.extend_from_slice(&0u16.to_le_bytes()); // luma_y_start
+        hdr.extend_from_slice(&0u32.to_le_bytes()); // segment_size
+        hdr.push(0); // overhang_byte
+        hdr.push(0); // num_overhang_bits
+        for _ in 0..3 {
+            hdr.extend_from_slice(&0i16.to_le_bytes()); // last_dc
+        }
+        hdr.extend_from_slice(&0u16.to_le_bytes()); // padding
+        // GRB: 64 bytes of garbage. 64 (file size) - 64 (garbage) - 92 (header
+        // read) - 2 (SOI) underflows on unpatched code.
+        hdr.extend_from_slice(b"GRB");
+        hdr.extend_from_slice(&64u32.to_le_bytes());
+        hdr.extend_from_slice(&[0; 64]);
+        assert!(decode_lepton(&hostile_lep(&hdr)).is_err());
     }
 
     /// Regression for patch 8 (jpeg_file_size_left): a declared file size
@@ -599,6 +664,45 @@ mod tests {
         ]
         .concat();
         assert!(decode_lepton(&hostile_lep(&hdr_payload(&raw, &inverted))).is_err());
+    }
+
+    /// Deterministic discriminator for SAGETHUMBS PATCH 4 (thread-range
+    /// validation). The HH serialization only carries each thread's
+    /// luma_y_start — `ThreadHandoff::deserialize` derives `end[i] = start[i+1]`
+    /// and the last end is filled with max_luma afterwards — so the only
+    /// invalid range reachable through the wire format is a DECREASING start
+    /// sequence: [4, 2) on thread 0. Unpatched, the inverted range later hits
+    /// `BlockBasedImage::merge`'s contiguity assert or `luma_y_end -
+    /// luma_y_start` (SAGETHUMBS PATCH 7), a panic in ALL builds; patched, the
+    /// header is rejected as a clean BadLeptonFile.
+    #[test]
+    fn lepton_inverted_thread_luma_ranges_are_clean_error() {
+        // Same parseable raw header as above (SOF0 + DQT + SOS, 92 bytes).
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00,
+        ]);
+        raw.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+        raw.extend_from_slice(&[1; 64]);
+        raw.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(&raw);
+        // HH with two threads and DECREASING starts (4 then 2): deserialize
+        // derives thread 0's end from thread 1's start → inverted [4, 2).
+        hdr.extend_from_slice(b"HH");
+        hdr.push(2);
+        for start in [4u16, 2u16] {
+            hdr.extend_from_slice(&start.to_le_bytes()); // luma_y_start
+            hdr.extend_from_slice(&0u32.to_le_bytes()); // segment_size
+            hdr.push(0); // overhang_byte
+            hdr.push(0); // num_overhang_bits
+            for _ in 0..3 {
+                hdr.extend_from_slice(&0i16.to_le_bytes()); // last_dc
+            }
+            hdr.extend_from_slice(&0u16.to_le_bytes()); // padding
+        }
+        assert!(decode_lepton(&hostile_lep(&hdr)).is_err());
     }
 
     /// Regression for patch 5 (capped header length fields): the HDR, FRS, and
@@ -658,6 +762,18 @@ mod tests {
             big[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
         }
         assert!(decode_lepton(&big).is_err());
+
+        // SAGETHUMBS PATCH 5 discriminator (capped header length fields): a
+        // header whose HDR marker declares hdrs = u32::MAX must be a clean Err.
+        // Unpatched, `read_lepton_compressed_header` runs
+        // `hdr_data.resize(hdrs, 0)` with no bound — a ~4 GiB allocation that
+        // aborts the process (panic=abort) wherever the allocator fails, i.e.
+        // the original OOM P0. Patched, the cap() closure rejects it as
+        // BadLeptonFile before any allocation.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&u32::MAX.to_le_bytes());
+        hdr.push(0); // one payload byte so the declared length is the only defect
+        assert!(decode_lepton(&hostile_lep(&hdr)).is_err());
     }
 
     /// Regenerates tests/fixtures/lepton.lep. Run manually when the committed

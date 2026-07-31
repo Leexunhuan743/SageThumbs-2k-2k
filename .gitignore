@@ -76,3 +76,6 @@ Thumbs.db
 # its generated lockfile is not part of the patch.
 vendor/lepton_jpeg/Cargo.lock
 vendor/lepton_jpeg/target/
+
+# lat semantic-search vector cache (regenerated locally; do not track)
+lat.md/.cache/vectors.db

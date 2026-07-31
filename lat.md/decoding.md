@@ -1,12 +1,12 @@
 # Decoding
 
-How thumbnails, previews, and first pages are produced for the 327 supported formats, and which engine backs each tier: pure-Rust codecs, OS codecs, or the sandboxed ImageMagick child.
+How thumbnails, previews, and first pages are produced for the 327 supported formats, and which engine backs each tier: pure-Rust codecs, OS codecs, or the isolated ImageMagick child process.
 
 ## Decoder Tiers
 
-The ladder, in order: the `image` crate → WIC (HEIC/AVIF/RAW) → ImageMagick subprocess → headerless-Targa fallback.
+The ladder, in order: JPEG XL → Lepton (.lep) → `image` crate → raw-preview (camera-RAW baked JPEG) → WIC (HEIC/HEIF, AVIF, camera RAW, JPEG 2000) → TGA → ImageMagick subprocess → raw-preview (full-fidelity) → lenient embedded-JPEG last resort.
 
-Lepton (.lep) and JPEG XL decode through their own signature-gated pure-Rust tiers before the `image` crate; see [[decoding#Lepton]] and [[architecture#Decode Pipeline]]. Video, PDF, SVG, ebooks/comics, and audio cover art take dedicated paths that bypass the ladder.
+JPEG XL and Lepton are signature-gated pure-Rust tiers before the `image` crate — a Lepton file decodes to a bit-exact JPEG the image tier consumes ([[decoding#Lepton]]). The first raw-preview tier runs only on the thumbnail/menu-preview path; the magick tier and the second raw-preview tier run only when `external` — the in-shell classic menu skips both. TGA has no magic bytes, so a header sanity check decodes it with an explicit format BEFORE magick — a real TGA skips a doomed (20 s-capped) subprocess. ImageMagick itself is an isolated child process: `-limit` resource caps, a hardened app-local policy.xml, a named-semaphore concurrency gate, and an external kill timeout (20 s, 3 s for metafiles). The lenient last resort (`largest_embedded_jpeg`) surfaces any decodable embedded JPEG — a RAW's EXIF thumbnail — rather than a blank tile. Video, PDF, SVG, ebooks/comics, and audio cover art take dedicated paths that bypass the ladder; [[architecture#Decode Pipeline]] is the pipeline overview.
 
 ## Video Frames
 

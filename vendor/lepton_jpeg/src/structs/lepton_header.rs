@@ -388,9 +388,6 @@ impl LeptonHeader {
             ) {
                 // CRS marker
                 self.rinfo.rst_cnt_set = true;
-<<<<<<< HEAD
-                let rst_count = header_reader.read_u32::<LittleEndian>()?;
-=======
                 // SAGETHUMBS PATCH (0.5.8): cap the CRS rst_count loop like the
                 // other hostile length fields above. A deflate bomb (a few MiB of
                 // compressed input, bounded only by compressed_header_size) can
@@ -408,7 +405,6 @@ impl LeptonHeader {
                         "CRS entry count exceeds max_jpeg_file_size",
                     );
                 }
->>>>>>> 386ed0b (feat(lepton): harden the vendored decoder with patches 12-17 (audit round 2))
 
                 for _i in 0..rst_count {
                     self.rinfo

@@ -10,7 +10,9 @@ The core crate `sagethumbs2k_core` (`src/`) is rlib-only; the `dll/` crate is th
 
 ## Decode Pipeline
 
-Decode is tiered so the cheapest successful path wins: the `image` crate first, then WIC, then a sandboxed ImageMagick subprocess, with a headerless-Targa fallback; SVG routes up front to resvg.
+Cheapest successful path wins, tier by tier: JPEG XL → Lepton (.lep) → `image` crate → raw-preview → WIC (HEIC/HEIF, AVIF, camera RAW, JPEG 2000) → TGA → ImageMagick child → raw-preview (full-fidelity) → lenient embedded-JPEG last resort.
+
+The ladder is `decode_any_with_wic_target` in [[src/decode.rs]]: JPEG XL and Lepton are signature-gated pure-Rust tiers that run before the `image` crate (Lepton decodes to a bit-exact JPEG the image tier consumes); the camera-RAW baked-JPEG preview runs before WIC on the thumbnail/menu path and again after magick as the full-fidelity fallback; TGA (header-sanity-detected — it has no magic bytes) decodes with an explicit format BEFORE magick so a real TGA skips a doomed (20 s-capped) subprocess; the lenient embedded-JPEG scan (`largest_embedded_jpeg`) is the strict last resort, so a RAW's EXIF thumbnail still shows rather than a blank tile. ImageMagick runs as an isolated child process — no OS sandbox (no Job object / restricted token / SIL): `-limit` resource caps, a hardened app-local policy.xml, a named-semaphore concurrency gate, and an external kill timeout (20 s, 3 s for metafiles). SVG routes up front to resvg.
 
 [[decoding#Decoder Tiers]] has the full ladder, and [[src/lib.rs#magick_available]] gates the magick-only Convert targets on compact installs.
 
@@ -22,9 +24,9 @@ The five are ThumbnailProvider (`IThumbnailProvider` + `IInitializeWithStream`),
 
 ## Crash Isolation
 
-The shell surface runs under `panic = "abort"` with `clippy::unwrap_used`/`expect_used` denied, and every COM entry point is wrapped in a panic guard — a malformed file cannot abort Explorer.
+The shell surface runs under `panic = "abort"` with `clippy::unwrap_used`/`expect_used` at warn — escalated to deny in the verify gate — and every COM entry point is wrapped in a panic guard — a malformed file cannot abort Explorer.
 
-Hostile decode runs out-of-process in Explorer's dllhost surrogate, ImageMagick runs as a sandboxed child with a kill timeout, and decompression-bomb guards bound archive and pixel memory.
+Hostile decode runs out-of-process in Explorer's dllhost surrogate, ImageMagick runs as an isolated child process with resource limits and kill timeouts, and decompression-bomb guards bound archive and pixel memory.
 
 ## Settings and Localization
 
