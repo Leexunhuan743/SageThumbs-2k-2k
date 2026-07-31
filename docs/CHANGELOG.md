@@ -6,7 +6,7 @@ All notable user-facing changes to **SageThumbs 2K**. Newest first.
 
 ### Added
 
-- **Lepton files are now supported end to end.** Dropbox's lossless-JPEG format (`.lep`) now gets a real thumbnail, preview-pane and Quick-preview rendering, and the full right-click treatment — Convert, Resize, Rotate, Copy to clipboard, OCR, and metadata in the Properties sheet — with EXIF orientation honored like any other photo, and `st2k convert` accepting `.lep` as input. Decoding is by file content (Lepton magic), so the same file works however it is named.
+- **Lepton files are now supported end to end.** Dropbox's lossless-JPEG format (`.lep`) now gets a real thumbnail, preview-pane and Quick-preview rendering, and the full right-click treatment — Convert, Resize, Rotate, Copy to clipboard, OCR, and metadata in the Properties sheet — with EXIF orientation honored like any other photo, and `st2k convert` accepting `.lep` as input. Decoding is by file content (Lepton magic), so the same file works however it is named. **Decode-only by design**: `.lep` is deliberately NOT a Convert output target — no ecosystem reader exists for the format, and the vendored encoder stays out of the shipped binaries (test-only, LTO-dead in the DLL).
 
 ### Fixed
 
