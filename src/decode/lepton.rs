@@ -173,13 +173,17 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     // Walk the JPEG segments to the first SOF0/1/2 (FF C0/C1/C2), mirroring
     // the vendored decoder's parse_next_segment strictness so a "plausible
     // header" means the same thing on both paths: fill bytes (FF FF), TEM,
-    // in-stream RSTn/SOI, a second SOF, and unknown markers are all errors
-    // there, and a hostile header could otherwise plant a FAKE SOF that the
-    // probe reports while the crate rejects the file (attacker-chosen
-    // dimensions in the Details pane for a file that can never decode). Every
-    // index is bounds-checked; a segment whose declared length is not fully
-    // present (or is absurdly small) ends the probe with None.
+    // in-stream RSTn/SOI, a SECOND SOF, a lone SOF with no scan, and unknown
+    // markers are all errors there, and a hostile header could otherwise
+    // plant a FAKE SOF that the probe reports while the crate rejects the
+    // file (attacker-chosen dimensions in the Details pane for a file that
+    // can never decode). Every index is bounds-checked; a segment whose
+    // declared length is not fully present (or is absurdly small) ends the
+    // probe with None.
     let mut i = 0usize;
+    // Dimensions of the FIRST (and only) SOF, returned only once a real SOS
+    // scan has been seen — the decode tier's scan gate rejects a lone SOF.
+    let mut sof_dims: Option<(u32, u32)> = None;
     while i + 1 < raw.len() {
         if raw[i] != 0xFF {
             return None; // marker byte expected between segments
@@ -201,10 +205,13 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
             0x01 | 0xD0..=0xD7 => return None,
             // A second SOI inside the stream is rejected by the decoder.
             0xD8 => return None,
-            // SOS / EOI before any SOF: no usable dimensions in this header.
-            0xD9 | 0xDA => return None,
-            // The first SOF0/1/2 must carry a well-formed payload: precision
-            // 8, dimensions within the tier caps, 1..=3 components (the lepton
+            // EOI before any SOS: the header has no decodable scan.
+            0xD9 => return None,
+            // SOS: the header is decodable only if a SOF was seen; a lone SOF
+            // (or no SOF at all) means the decode tier rejects the file.
+            0xDA => return sof_dims,
+            // A SOF0/1/2 must carry a well-formed payload: precision 8,
+            // dimensions within the tier caps, 1..=3 components (the lepton
             // format and the decode tier reject 4-color JPEGs — mirroring the
             // decoder here keeps "plausible header" identical on both paths)
             // with their 3-byte entries fully present (seg_len >= 8 + 3*cmpc)
@@ -241,7 +248,14 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
                 {
                     return None;
                 }
-                return Some((height, width));
+                // The decoder rejects images with MULTIPLE SOF blocks; a
+                // second SOF anywhere in the header makes the file
+                // undecodable, so keep walking instead of returning here.
+                if sof_dims.is_some() {
+                    return None;
+                }
+                sof_dims = Some((height, width));
+                i = seg_end;
             }
             // Any other marker carries a length field.
             _ => {
@@ -254,6 +268,7 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
             }
         }
     }
+    // Header ended without a scan (or without any SOF): not decodable.
     None
 }
 
@@ -1048,7 +1063,7 @@ mod tests {
     #[test]
     fn probe_dimensions_skips_preceding_segments() {
         let mut hdr = b"HDR".to_vec();
-        hdr.extend_from_slice(&33u32.to_le_bytes());
+        hdr.extend_from_slice(&43u32.to_le_bytes());
         hdr.extend_from_slice(&[
             0xFF, 0xE0, 0x00, 0x12, // APP0, len 18 (2 length bytes + 16 payload)
             b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
@@ -1057,8 +1072,40 @@ mod tests {
             0x08, // precision 8
             0x01, 0xE0, 0x02, 0x80, // height 480, width 640
             0x01, 0x01, 0x11, 0x00, // 1 component
+            // SOS so the header is DECODABLE — a lone SOF with no scan is
+            // rejected by the decode tier's scan gate, and the probe mirrors
+            // that (returning dims for an undecodable header would break the
+            // "plausible header means the same thing on both paths"
+            // invariant).
+            0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
         ]);
         assert_eq!(probe_dimensions(&hostile_lep(&hdr)), Some((480, 640)));
+    }
+
+    /// The decoder rejects headers with MULTIPLE SOF blocks and headers whose
+    /// SOF is never followed by a scan; the probe must mirror both instead of
+    /// reporting the first SOF's dimensions for an undecodable file.
+    #[test]
+    fn probe_dimensions_rejects_second_sof_and_lone_sof() {
+        // A valid SOF followed by a SECOND SOF (no SOS): undecodable.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&26u32.to_le_bytes());
+        hdr.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, // SOF0, len 11
+            0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x01, 0x11, 0x00, // 16x16, 1 comp
+            0xFF, 0xC1, 0x00, 0x0B, // SOF1, len 11 — second SOF
+            0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x01, 0x11, 0x00,
+        ]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+
+        // A valid SOF with NO SOS at all (header ends): undecodable.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&13u32.to_le_bytes());
+        hdr.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, // SOF0, len 11
+            0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x01, 0x11, 0x00,
+        ]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
     }
 
     /// `probe_dimensions` must never panic and must return None for every

@@ -142,11 +142,12 @@ fn head_prefix(path: &str) -> Option<Vec<u8>> {
 /// (no pixel decode) and the reconstructed stream is parsed instead. `None` =
 /// no EXIF / malformed / unreadable — never a panic.
 fn exif_from_path(path: &str) -> Option<exif::Exif> {
-    if head_prefix(path)
-        .as_deref()
-        .is_some_and(|h| h.starts_with(&[0xCF, 0x84]))
-    {
-        return lep_container_header(path).and_then(|b| crate::decode::lepton::probe_exif(&b));
+    // lep_container_header checks the magic itself, so a .lep file costs ONE
+    // open (28 fixed bytes + the declared compressed header) — no separate
+    // head_prefix pre-check. Non-lepton files fall through to the ordinary
+    // parser below.
+    if let Some(hdr) = lep_container_header(path) {
+        return crate::decode::lepton::probe_exif(&hdr);
     }
     let mut buf = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     exif::Reader::new().read_from_container(&mut buf).ok()
