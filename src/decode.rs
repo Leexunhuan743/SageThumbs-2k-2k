@@ -451,9 +451,10 @@ pub fn decode_menu_preview(bytes: &[u8]) -> Result<DynamicImage> {
     decode_cheap(bytes)
 }
 
-/// The fast subset of the image tiers (jxl-signature → `image` crate → WIC → TGA →
-/// embedded-JPEG), EXIF-oriented like the full path but with NO external/subprocess
-/// tier (`external = false`) and no SVG/PDF/video. Used by [`decode_menu_preview`].
+/// The fast subset of the image tiers (jxl-signature → lepton-signature → `image`
+/// crate → WIC → TGA → embedded-JPEG), EXIF-oriented like the full path but with
+/// NO external/subprocess tier (`external = false`) and no SVG/PDF/video. Used by
+/// [`decode_menu_preview`].
 fn decode_cheap(bytes: &[u8]) -> Result<DynamicImage> {
     Ok(apply_exif_orientation(
         decode_any(bytes, RawPreviewOrder::BeforeExternal, false)?,

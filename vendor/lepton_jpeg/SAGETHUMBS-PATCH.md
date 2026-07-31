@@ -2,7 +2,8 @@
 
 This directory is the crates.io `lepton_jpeg` 0.5.8 package
 (`microsoft/lepton_jpeg_rust` at tag `0.5.8`) plus the upstream `LICENSE.txt`
-and `NOTICE.txt` (Apache-2.0), with one arithmetic-overflow fix.
+and `NOTICE.txt` (Apache-2.0), with ten crash-safety fixes (numbered below;
+each changed hunk carries a `SAGETHUMBS PATCH (0.5.8)` marker comment).
 
 ## The bug
 
@@ -34,8 +35,8 @@ doesn't cover the sum of its own segment sizes underflows there instead.
 All fixes are in `src/`; each is marked with a `SAGETHUMBS PATCH (0.5.8)`
 comment. Together they enforce the invariant that a corrupt or malicious
 `.lep` can produce a `LeptonError` — never a panic/abort inside the shell
-host (see `src/safety.rs` and the `panic = "abort"` rationale in
-`src/lib.rs`).
+host (see the repo's `src/safety.rs` and the `panic = "abort"` rationale in
+the repo's `src/lib.rs`).
 
 1. **`structs/lepton_header.rs` — early_eof size arithmetic** (`saturating_sub`
    on `jpeg_file_size - garbage - header - SOI` and the per-segment loop).
@@ -47,7 +48,7 @@ host (see `src/safety.rs` and the `panic = "abort"` rationale in
    `BadLeptonFile`.
 3. **`structs/lepton_header.rs` — first `parse()` must reach a scan.**
    `JpegHeader::parse` returns `Ok(false)` when the raw JPEG header ends at
-   EOI before any SOS; the boolean was ignored. A ~30-byte hostile file
+   EOI before any SOS; the boolean was ignored. A tiny hostile file
    (bare `FF D9` header + an HH marker) then indexed an empty `trunc_info`
    (`get_block_height(0)`) — a Vec OOB panic in ALL builds, release
    included. Requiring a real scan header also blocks the sibling
@@ -94,6 +95,18 @@ host (see `src/safety.rs` and the `panic = "abort"` rationale in
    its Weak never expires, workers are reused). Regression tests:
    `pool_drop_releases_idle_list` (drop releases the idle list) and the
    SageThumbs `decode::lepton` suite.
+10. **`jpeg/truncate_components.rs` — saturating `max_d_pos[i] + 1`.**
+    The EEE marker's `max_dpos[0..3]` fields are hostile-controlled u32s read
+    with no validation (only `max_sah` gets a `u8::try_from`); a file
+    declaring `0xFFFFFFFF` overflowed the `+ 1` in `set_truncation_bounds`
+    (header-parse main thread, no catch_unwind) and panicked in
+    overflow-checked builds (dev/tests; reproduced with "attempt to add with
+    overflow" at truncate_components.rs:69). Release wrapped to 0 and failed
+    cleanly (no shell-host abort), but the invariant "hostile .lep → error,
+    never a panic" was violated in every overflow-checked build. Saturating:
+    `u32::MAX` now means "no truncation", which is what the value represents
+    (real encoders write actual sizes; a wrapped zero would silently empty
+    the image).
 
 ## Verification
 
@@ -114,7 +127,21 @@ host (see `src/safety.rs` and the `panic = "abort"` rationale in
   bit-flip/truncation mutations + an oversized-declared-size file must never
   panic, only Ok/Err.
 
+- `decode::lepton::tests::lepton_eee_maxdpos_saturates`, `..._early_eof_size_arithmetic_is_bounded`,
+  `..._garbage_size_underflow_is_bounded`, `..._thread_ranges_are_validated`,
+  `..._header_lengths_are_capped`: deterministic hostile-header constructions
+  (a real raw JPEG header + crafted EEE/GRB/HH markers, lengths and declared
+  sizes chosen per patch) that panic on the unpatched code paths above and
+  must now return a clean error — or, for `max_dpos = u32::MAX`, decode
+  normally.
+- Patch 6 (bounded `rst_cnt`) has no deterministic in-repo trigger: reaching
+  the recode-time index needs a restart-carrying (DRI) v1 file whose scan
+  data still decodes, and the corpus contains no such sample (narrowrst.lep
+  is version 4). The mutation fuzz patrols the surrounding space; revisit
+  when a restart-carrying v1 sample lands in the corpus.
+
 Remove this override after upstream ships the fixes (upstream `main` still
 carries the unchecked arithmetic, the ignored parse boolean, the unbounded
-header resizes, the thread-pool Arc leak, and the send-unwrap — and the
-LepViewer/LepThumb project vendors the same unfixed 0.5.8).
+header resizes, the unvalidated thread ranges, the unbounded `rst_cnt` index,
+the unguarded `max_d_pos + 1`, the thread-pool Arc leak, and the send-unwrap —
+and the LepViewer/LepThumb project vendors the same unfixed 0.5.8).
