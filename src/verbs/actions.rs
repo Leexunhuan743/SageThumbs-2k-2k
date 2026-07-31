@@ -80,8 +80,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_UPDATEDIR, SHCNF_PATHW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, MessageBoxW, SystemParametersInfoW, MB_ICONWARNING, MB_OK,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
+    GetSystemMetrics, MessageBoxW, SystemParametersInfoW, MB_ICONINFORMATION, MB_ICONWARNING,
+    MB_OK, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
     SPI_SETDESKWALLPAPER,
 };
 
@@ -456,11 +456,34 @@ impl ActionReport {
     // (reveal noise-check lives at module scope as `reveal_is_noise` so it's unit-testable.)
 
     /// Show a result message to the user — ONLY when something failed. Silent on
-    /// full success (don't nag), on delegated verbs, and on nothing-applicable.
+    /// full success (don't nag), on delegated verbs, and on nothing-applicable
+    /// UNLESS the caller left a reason note (e.g. "strip is JPEG/PNG only; all
+    /// selected files were skipped") — a fully-skipped selection with zero
+    /// feedback looks like the verb silently did nothing.
     /// `parent` is the shell HWND (classic menu) or None (modern command).
     pub fn surface(&self, parent: Option<windows::Win32::Foundation::HWND>) {
-        if self.delegated || self.attempted == 0 || self.failed() == 0 {
-            return; // nothing went wrong (or there was nothing / a window owns it)
+        if self.delegated {
+            return; // a window owns it
+        }
+        if self.attempted == 0 {
+            // Nothing was applicable. Surface a caller-provided reason if there
+            // is one; otherwise stay silent (the common all-success case).
+            if let Some(note) = &self.note {
+                let t = crate::wide(note);
+                let c = crate::wide("SageThumbs 2K");
+                unsafe {
+                    MessageBoxW(
+                        parent,
+                        PCWSTR(t.as_ptr()),
+                        PCWSTR(c.as_ptr()),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+            }
+            return;
+        }
+        if self.failed() == 0 {
+            return;
         }
         let failed = self.failed();
         let mut msg = format!("{} of {} items succeeded.", self.done, self.attempted);

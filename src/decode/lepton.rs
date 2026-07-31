@@ -14,13 +14,19 @@ use lepton_jpeg::{EnabledFeatures, LeptonThreadPriority, SimpleThreadPool};
 /// length field [`probe_dimensions`] trusts — the header probe rejects files
 /// that declare more, so "plausible header" means the same thing on both
 /// paths.
-const MAX_JPEG_FILE_SIZE: u32 = 128 * 1024 * 1024;
+pub(crate) const MAX_JPEG_FILE_SIZE: u32 = 128 * 1024 * 1024;
 
 /// Lepton signature: the tau symbol `0xCF 0x84` (LEPTON_FILE_HEADER). The version
 /// byte at [2] and the 'Z'/'X' JPEG-type byte at [3] are validated by the decoder
 /// itself. The 0xCE 0xB6 zlib-outer variant and UJG ("UJ") are NOT supported by
 /// `lepton_jpeg` — deliberately not matched here; such files fall through to the
-/// other tiers and fail harmlessly (stock icon).
+/// other tiers and fail harmlessly (stock icon). C++-producible edge encodings
+/// are likewise unmatched by design and fall through: 'Y'-type files
+/// (lepton -startbyte=N sliced encodings, which also carry PGR prefix-garbage
+/// markers) and PGE (embedded-JPEG garbage) are rejected by the decoder's
+/// type byte and marker checks; the pre-2016 PAD marker (replaced by P0D in
+/// dropbox commit c6deaa9) is rejected as an unknown marker. All are clean
+/// fall-throughs, never a crash.
 pub(super) fn looks_like_lepton(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xCF, 0x84])
 }
@@ -152,45 +158,88 @@ pub(crate) fn probe_exif(bytes: &[u8]) -> Option<exif::Exif> {
 /// Returns `(height, width)` — the SOF marker stores height before width — or
 /// `None` on any malformation.
 pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    const SOI: u8 = 0xD8;
-    const SOS: u8 = 0xDA;
-    const EOI: u8 = 0xD9;
-
     let raw = decompress_raw_header(bytes)?;
 
-    // Walk the JPEG segments to the first SOF0/1/2 (FF C0/C1/C2). Every index
-    // is bounds-checked; a segment whose declared length is not fully present
-    // (or is absurdly small) ends the probe with None.
+    // Walk the JPEG segments to the first SOF0/1/2 (FF C0/C1/C2), mirroring
+    // the vendored decoder's parse_next_segment strictness so a "plausible
+    // header" means the same thing on both paths: fill bytes (FF FF), TEM,
+    // in-stream RSTn/SOI, a second SOF, and unknown markers are all errors
+    // there, and a hostile header could otherwise plant a FAKE SOF that the
+    // probe reports while the crate rejects the file (attacker-chosen
+    // dimensions in the Details pane for a file that can never decode). Every
+    // index is bounds-checked; a segment whose declared length is not fully
+    // present (or is absurdly small) ends the probe with None.
     let mut i = 0usize;
     while i + 1 < raw.len() {
         if raw[i] != 0xFF {
             return None; // marker byte expected between segments
         }
         let marker = raw[i + 1];
+        // Every marker except the lengthless ones carries a u16 length; read it
+        // up front so the SOF branch can validate its payload against it.
+        let seg_len = if matches!(marker, 0x01 | 0xD0..=0xD8 | 0xD9 | 0xDA | 0xFF) {
+            0
+        } else {
+            u16::from_be_bytes(raw.get(i + 2..i + 4)?.try_into().ok()?) as usize
+        };
         match marker {
-            // SOI and the standalone markers (TEM, RSTn) carry no length field.
-            SOI | 0x01 | 0xD0..=0xD7 => i += 2,
+            // Fill byte (FF FF) — the decoder errors on it; so do we.
+            0xFF => return None,
+            // TEM and RSTn are standalone (lengthless) markers that are only
+            // legal INSIDE scan data, never in the header — the decoder
+            // rejects them here.
+            0x01 | 0xD0..=0xD7 => return None,
+            // A second SOI inside the stream is rejected by the decoder.
+            0xD8 => return None,
             // SOS / EOI before any SOF: no usable dimensions in this header.
-            SOS | EOI => return None,
+            0xD9 | 0xDA => return None,
+            // The first SOF0/1/2 must carry a well-formed payload: precision
+            // 8, dimensions within the tier caps, 1..=3 components (the lepton
+            // format and the decode tier reject 4-color JPEGs — mirroring the
+            // decoder here keeps "plausible header" identical on both paths)
+            // with their 3-byte entries fully present (seg_len >= 8 + 3*cmpc)
+            // and the whole declared segment present in the stream.
+            0xC0..=0xC2 => {
+                if seg_len < 8 {
+                    return None;
+                }
+                let seg_end = i.checked_add(2)?.checked_add(seg_len)?;
+                raw.get(i + 2..seg_end)?; // declared segment must be fully present
+                let payload = i + 4;
+                raw.get(payload..payload + 6)?;
+                if raw[payload] != 8 {
+                    return None; // only 8-bit precision is supported
+                }
+                let height = u32::from_be_bytes([0, 0, raw[payload + 1], raw[payload + 2]]);
+                let width = u32::from_be_bytes([0, 0, raw[payload + 3], raw[payload + 4]]);
+                let cmpc = usize::from(raw[payload + 5]);
+                if !(1..=3).contains(&cmpc) {
+                    return None;
+                }
+                // Component entries (jid, sampling nibbles, qt index) must all
+                // be present, and the dimensions must fit the same caps the
+                // decode tier applies (every other header probe in the repo
+                // rejects above MAX_DIM; so do we).
+                if seg_len < 8 + 3 * cmpc {
+                    return None;
+                }
+                if height == 0
+                    || width == 0
+                    || height > limits::MAX_DIM
+                    || width > limits::MAX_DIM
+                    || u64::from(height) * u64::from(width) > limits::MAX_PIXELS
+                {
+                    return None;
+                }
+                return Some((height, width));
+            }
+            // Any other marker carries a length field.
             _ => {
-                let seg_len = u16::from_be_bytes(raw.get(i + 2..i + 4)?.try_into().ok()?) as usize;
                 if seg_len < 2 {
                     return None;
                 }
                 let seg_end = i.checked_add(2)?.checked_add(seg_len)?;
                 raw.get(i + 2..seg_end)?; // declared segment must be fully present
-                if matches!(marker, 0xC0..=0xC2) {
-                    // Payload: precision(1) + height u16 BE + width u16 BE +
-                    // component count(1) + components. seg_len >= 8 guarantees
-                    // the precision..width bytes below are in range.
-                    if seg_len < 8 {
-                        return None;
-                    }
-                    let payload = i + 4;
-                    let height = u32::from_be_bytes([0, 0, raw[payload + 1], raw[payload + 2]]);
-                    let width = u32::from_be_bytes([0, 0, raw[payload + 3], raw[payload + 4]]);
-                    return (height > 0 && width > 0).then_some((height, width));
-                }
                 i = seg_end;
             }
         }
@@ -245,8 +294,12 @@ mod tests {
         let feats = EnabledFeatures {
             progressive: true,
             reject_dqts_with_zeros: false,
-            max_jpeg_width: 4096,
-            max_jpeg_height: 4096,
+            // The encoder supports up to 16386 (its compat default); MAX_DIM
+            // (16384) matches the decode tier's ceiling, so every corpus jpg
+            // the DECODER accepts is also roundtripped — the old 4096 helper
+            // cap silently skipped all larger images in BOTH directions.
+            max_jpeg_width: limits::MAX_DIM,
+            max_jpeg_height: limits::MAX_DIM,
             use_16bit_dc_estimate: true,
             use_16bit_adv_predict: true,
             accept_invalid_dht: true,
@@ -609,7 +662,9 @@ mod tests {
 
     /// C++-encoded .lep files (dropbox/lepton, incl. legacy) must decode or fail
     /// cleanly — never panic. gold-legacy.lep is v1 legacy C++ (panicked before the
-    /// vendored decode fix), iphone16.lep is v3, narrowrst.lep is v4 (unsupported by
+    /// vendored decode fix), iphone16.lep is a format-compatible C++ v1 file (the
+    /// "16" is its 16 thread handoffs; it carries CRS+FRS restart markers),
+    /// narrowrst.lep is v4 (unsupported by
     /// `lepton_jpeg` ⇒ must Err).
     #[test]
     fn cpp_corpus_decodes_or_errors_cleanly() {
@@ -655,8 +710,8 @@ mod tests {
     /// Every encodable corpus jpg round-trips bit-exactly through lepton: decoding
     /// its .lep yields the same dims and pixels as the app's reference decode of the
     /// original jpg (the identical tail pipeline `decode_lepton` ends at). Files the
-    /// encoder rejects (broken/truncated, or beyond the helper's 4096px cap) are
-    /// skipped — they exist in the corpus precisely as decode-robustness samples.
+    /// encoder rejects (broken/truncated) are skipped — they exist in the corpus
+    /// precisely as decode-robustness samples.
     #[test]
     fn cpp_jpeg_roundtrip_matches_source_pixels() {
         let Some(dir) = cpp_corpus_dir() else { return };
@@ -678,7 +733,18 @@ mod tests {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let jpg = std::fs::read(&path).unwrap();
             let Some(lep) = try_lepton_bytes(&jpg) else {
-                skipped.push(format!("{name}: encode rejected"));
+                // narrowrst.jpg is the one corpus JPEG with in-scan DRI restart
+                // markers; the encoder refuses bit-exact re-encoding of restart
+                // streams (InvalidResetCode in read_first_scan) BY DESIGN — a
+                // capability limitation, not a broken file (the C++ encoder
+                // handles it), and the RST encode/decode path stays
+                // unexercised by roundtrips (see SAGETHUMBS-PATCH.md fix 6).
+                let why = if name == "narrowrst.jpg" {
+                    "restart-marker JPEG, encoder refuses bit-exact re-encode"
+                } else {
+                    "encode rejected"
+                };
+                skipped.push(format!("{name}: {why}"));
                 continue;
             };
             let img = decode_lepton(&lep).unwrap_or_else(|e| {
@@ -691,6 +757,11 @@ mod tests {
                 skipped.push(format!("{name}: reference decode of original failed"));
                 continue;
             };
+            // `decode_lepton` applies the reconstructed JPEG's EXIF orientation
+            // exactly once (the container is bit-exact, so the tags survive);
+            // mirror that on the reference so files with orientation != 1
+            // (slrcity.jpg = 8) compare apples-to-apples.
+            let reference = super::super::apply_exif_orientation(reference, &jpg);
             assert_eq!(
                 (img.width(), img.height()),
                 (reference.width(), reference.height()),
@@ -702,6 +773,8 @@ mod tests {
                 "{name}: pixels mismatch"
             );
             if let Ok(plain) = image::load_from_memory(&jpg) {
+                // Same orientation mirror as above (plain load keeps raw order).
+                let plain = super::super::apply_exif_orientation(plain, &jpg);
                 assert_eq!(
                     (img.width(), img.height()),
                     (plain.width(), plain.height()),
@@ -717,6 +790,33 @@ mod tests {
         println!(
             "roundtripped {checked} corpus jpgs; skipped {}: {skipped:?}",
             skipped.len()
+        );
+    }
+
+    /// Bit-exact decode of a C++-ENCODED .lep file, anchored to its source JPEG.
+    /// Every other pixel comparison in the suite goes through the RUST encoder's
+    /// output, so a coordinated regression in the vpx/model/IDCT layer shared by
+    /// encoder and decoder would keep every gate green while C++-encoded files
+    /// misdecode. iphone16.lep is the one C++-v1 file in the corpus that decodes
+    /// (verified: version byte 1, 16 thread handoffs, CRS+FRS markers); its
+    /// source iphone.jpg sits beside it. Orientation is 1 for this pair, so the
+    /// tier's EXIF orientation application is a no-op on both sides.
+    #[test]
+    fn cpp_encoded_iphone16_decodes_bit_exact_to_source_jpeg() {
+        let Some(dir) = cpp_corpus_dir() else { return };
+        let lep = std::fs::read(dir.join("iphone16.lep")).unwrap();
+        let jpg = std::fs::read(dir.join("iphone.jpg")).unwrap();
+        let img = decode_lepton(&lep).expect("C++-encoded v1 file must decode");
+        let reference = super::super::decode_with_image(&jpg).expect("source JPEG must decode");
+        assert_eq!(
+            (img.width(), img.height()),
+            (reference.width(), reference.height()),
+            "iphone16.lep dims must match iphone.jpg"
+        );
+        assert_eq!(
+            img.to_rgb8().into_raw(),
+            reference.to_rgb8().into_raw(),
+            "iphone16.lep pixels must be bit-exact to iphone.jpg"
         );
     }
 
@@ -744,7 +844,13 @@ mod tests {
             let lep = lepton_bytes(&jpg);
             let img = decode_lepton(&lep)
                 .unwrap_or_else(|e| panic!("{name}: progressive roundtrip decode failed: {e:?}"));
-            let reference = super::super::decode_with_image(&jpg).unwrap();
+            // Same orientation mirror as cpp_jpeg_roundtrip (decode_lepton
+            // applies the EXIF orientation exactly once; the raw decode does
+            // not — orientation != 1 sources must compare apples-to-apples).
+            let reference = super::super::apply_exif_orientation(
+                super::super::decode_with_image(&jpg).unwrap(),
+                &jpg,
+            );
             assert_eq!(
                 (img.width(), img.height()),
                 (reference.width(), reference.height()),
@@ -940,5 +1046,24 @@ mod tests {
         assert!(probe_exif(lep).is_none());
         // Hostile garbage still decompresses-guarded: None, no panic.
         assert!(probe_exif(&[0xCF, 0x84, 0x01, b'Z', 0, 0, 0, 0]).is_none());
+    }
+
+    /// PATCH 16 regression: the marker loop's trailing `assert!(remaining == 0)`
+    /// was reachable — a stream ending with 1-2 bytes after the last marker
+    /// breaks the 3-byte prefix read on UnexpectedEof, then `read_to_end`
+    /// finds the bytes and the assert fires: a PANIC in ALL builds on the
+    /// header-parse main thread (no catch_unwind). Must be a clean error.
+    #[test]
+    fn trailing_bytes_after_markers_clean_error() {
+        let (raw, markers) = real_header_parts();
+        let mut payload = hdr_payload(&raw, &markers);
+        payload.extend_from_slice(&[0x00, 0x00]); // 2 trailing bytes after the last marker
+        let lep = hostile_lep_full(&payload, 64);
+        let r = std::panic::catch_unwind(|| decode_lepton(&lep));
+        assert!(
+            r.is_ok(),
+            "trailing bytes after the recovery markers must not hit the upstream assert"
+        );
+        assert!(r.unwrap().is_err());
     }
 }

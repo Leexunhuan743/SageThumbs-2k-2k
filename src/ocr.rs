@@ -31,14 +31,39 @@ use crate::verbs::read_capped;
 /// app's Quick-preview OCR uses, see `src/bin/app/ocr_result.rs` `to_png`) and
 /// re-encodes the result as PNG. Applies the same shared input cap
 /// ([`read_capped`]) as every other file-reading verb.
+///
+/// PDF contract: the decode tier rasterizes page 1 only at 1024 px on the
+/// long edge (decode.rs `%PDF-` branch) — OCR therefore reads the FIRST page
+/// of a multi-page PDF at thumbnail resolution, not the Quick-preview
+/// viewer's 2400 px navigation pages. Accepted and documented; bump the
+/// raster size here if OCR-on-later-pages ever matters.
 pub(crate) fn decode_to_png(path: &str) -> Result<Vec<u8>> {
     let bytes = read_capped(path)?;
+    // Fail fast BEFORE the full decode: the lepton tier accepts images up to
+    // 16384², which materializes ~1 GiB of RGBA here before the OCR engine's
+    // own MaxImageDimension check (9000 px) would reject it. Probe the
+    // container header (no pixel decode) and surface the DISTINCT
+    // too-large error up front. Other formats are bounded by the decode
+    // tier's existing limits.
+    if bytes.starts_with(&[0xCF, 0x84]) {
+        if let Some((h, w)) = crate::decode::lepton::probe_dimensions(&bytes) {
+            if w > OCR_ENGINE_MAX_DIM || h > OCR_ENGINE_MAX_DIM {
+                return Err(Error::from(OCR_IMAGE_TOO_LARGE));
+            }
+        }
+    }
     let img = crate::decode::decode_full(&bytes)?;
     let mut png = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|_| Error::from(E_FAIL))?;
     Ok(png)
 }
+
+/// The WinRT OCR engine's `OcrEngine::MaxImageDimension()` standard value
+/// (documented at 9000 px). The real value is queried at runtime inside
+/// [`recognize_bytes`]; this constant is only the decode-side fail-fast
+/// threshold for the lepton probe above.
+const OCR_ENGINE_MAX_DIM: u32 = 9000;
 
 /// Recognize text in the image at `path` and put it on the clipboard. Errors
 /// (no text found, no OCR language pack, unreadable image) leave the clipboard
@@ -51,11 +76,15 @@ pub fn ocr_to_clipboard(path: &str) -> Result<()> {
     unsafe { copy_text_to_clipboard(&text) }
 }
 
-/// Host-side budget for the whole OCR run (decode + recognize). The internal `block_op`
-/// waits are each capped at ~30 s but several stack, so bound the total here. OCR is reached
-/// only via `run_action_detached` (already off the UI thread + DLL pinned), but we apply the
-/// same recv_timeout + ModuleRef discipline as every other detached WinRT worker so the path
-/// is self-contained, not reliant on the caller's structure.
+/// Host-side budget for the RECOGNIZE stage only: the internal `block_op`
+/// waits are each capped at ~30 s but several stack, so bound the total here.
+/// The image decode ([`decode_to_png`]) runs BEFORE this worker and is NOT
+/// covered by it — its cost is bounded by the decode tier's own caps, and the
+/// worst case (a huge but decodable image) is a few seconds of CPU, not a
+/// parked shell thread. OCR is reached only via `run_action_detached` (already
+/// off the UI thread + DLL pinned), but we apply the same recv_timeout +
+/// ModuleRef discipline as every other detached WinRT worker so the path is
+/// self-contained, not reliant on the caller's structure.
 const OCR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The error [`recognize_bytes`] returns when the image is bigger than the recognizer's own
