@@ -250,7 +250,7 @@ if ($bundleMagick) {
     # raster-decode path. Regenerated from the installed ImageMagick's own exports on every build,
     # so an IM upgrade adapts automatically after the source pin + regression corpus are
     # deliberately updated. We compare the generated stub's export inventory to upstream
-    # before accepting it. See packaging/MAGICK.md.
+    # before accepting it. See docs/MAGICK.md.
     $stubWork = Join-Path $stage 'magick\_stubwork'
     New-Item -ItemType Directory $stubWork -Force | Out-Null
     try {

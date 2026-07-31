@@ -121,11 +121,17 @@ Read this before doing either again.
   into.
 - **The `pub(super)` widening trap:** when extracting a leaf module, everything it needs from
   the parent has to be widened to at least `pub(super)`. A blanket "widen anything the compiler
-  complains about" pass reliably **misses two categories**: (1) statics/consts/thread_locals
+  complains about" pass reliably **misses three categories**: (1) statics/consts/thread_locals
   declared *inside a macro invocation* (the macro expansion hides them from a simple visibility
-  grep), and (2) **struct fields** (a struct can be `pub(super)` while its individual fields are
-  still private, and the compiler error for that is easy to skim past). Check both explicitly,
-  don't assume "the struct is visible" means "the fields are too."
+  grep), (2) **struct fields** (a struct can be `pub(super)` while its individual fields are
+  still private, and the compiler error for that is easy to skim past), and (3) **inherent
+  `impl` block methods** (hit 2026-07-31 splitting `preview/markdown.rs`: widening `struct Fonts`
+  left `Fonts::new` and `Fonts::free` private, `E0624`). The rule that covers all three: widen
+  the type AND its fields AND its inherent methods, as three separate passes.
+  **But do NOT widen enum variants** -- a variant inherits its enum's visibility and a
+  `pub(super)` qualifier on one is `E0449` ("visibility qualifiers are not permitted here"), a
+  hard parse-adjacent error. A regex that widens "every indented item in the block" will happily
+  corrupt an `enum` body; scope any such sweep to `struct` and `impl` blocks only.
 - **The `super::` re-anchoring trap (hit again 2026-07-31, splitting `screenshot/overlay.rs`):**
   when the file you are splitting was ITSELF a child of something else, every `super::foo` in it
   meant *the grandparent* while the code lived in one file. Move that same line into a new leaf

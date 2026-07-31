@@ -6,7 +6,7 @@ function Get-ReleaseRequiredInputPaths {
         'Cargo.toml',
         'Cargo.lock',
         'docs/CHANGELOG.md',
-        'packaging/MAGICK.md',
+        'docs/MAGICK.md',
         'packaging/make-msix.ps1',
         'packaging/installer.iss',
         'packaging/size-budget.json',
