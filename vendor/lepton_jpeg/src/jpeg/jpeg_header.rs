@@ -37,7 +37,7 @@ use std::io::{Cursor, Read, Write};
 use std::num::NonZeroU32;
 
 use crate::LeptonError;
-use crate::consts::JpegType;
+use crate::consts::{COLOR_CHANNEL_NUM_BLOCK_TYPES, JpegType};
 use crate::enabled_features::EnabledFeatures;
 use crate::helpers::*;
 use crate::lepton_error::{AddContext, ExitCode, Result, err_exit_code};
@@ -961,9 +961,20 @@ impl JpegHeader {
 
                 self.cmpc = usize::from(segment[hpos + 5]);
 
-                if self.cmpc > 4
-                {
-                    return err_exit_code(ExitCode::UnsupportedJpeg, format!("image has {0} components, max 4 are supported", self.cmpc));
+                // SAGETHUMBS PATCH (0.5.8): the lepton format supports only 3
+                // color components — the C++ reference rejects 4-color JPEGs
+                // at header-parse time (custom_exit(UNSUPPORTED_4_COLORS)) and
+                // the encode side already gates on
+                // COLOR_CHANNEL_NUM_BLOCK_TYPES. Upstream accepted cmpc up to
+                // 4 here, so a hostile 4-component (CMYK) .lep reached
+                // RowSpec::get_row_spec_from_index's
+                // `image_data.len() <= COLOR_CHANNEL_NUM_BLOCK_TYPES` assert on
+                // a decode worker — a panic in ALL builds (release: process
+                // abort in the shell host). Tightening the shared parse gate to
+                // 3 matches both references; the encode-side check stays as
+                // defense in depth.
+                if self.cmpc > COLOR_CHANNEL_NUM_BLOCK_TYPES {
+                    return err_exit_code(ExitCode::UnsupportedJpeg, format!("image has {0} components, max 3 are supported", self.cmpc));
                 }
 
                 hpos += 6;

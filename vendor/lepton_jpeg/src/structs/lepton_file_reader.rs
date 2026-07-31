@@ -300,9 +300,9 @@ impl<'a> LeptonFileReader<'a> {
                             // jpeg_file_size smaller than the garbage blob (legacy
                             // C++ files, e.g. gold-legacy.lep) underflowed u64 and
                             // panicked in debug/overflow-checked builds.
-                            self.jpeg_file_size_left = self.jpeg_file_size_left.saturating_sub(
-                                self.lh.rinfo.garbage_data.len() as u64,
-                            );
+                            self.jpeg_file_size_left = self
+                                .jpeg_file_size_left
+                                .saturating_sub(self.lh.rinfo.garbage_data.len() as u64);
                         }
 
                         self.state = DecoderState::CMP();

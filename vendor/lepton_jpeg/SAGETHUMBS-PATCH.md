@@ -2,7 +2,7 @@
 
 This directory is the crates.io `lepton_jpeg` 0.5.8 package
 (`microsoft/lepton_jpeg_rust` at tag `0.5.8`) plus the upstream `LICENSE.txt`
-and `NOTICE.txt` (Apache-2.0), with ten crash-safety fixes (numbered below;
+and `NOTICE.txt` (Apache-2.0), with seventeen crash-safety fixes (numbered below;
 each changed hunk carries a `SAGETHUMBS PATCH (0.5.8)` marker comment).
 
 ## The bug
@@ -19,9 +19,8 @@ let mut max_last_segment_size = self.jpeg_file_size
 max_last_segment_size -= self.thread_handoff[i].segment_size;
 ```
 
-For files encoded by the **legacy C++ lepton** whose declared
-`jpeg_file_size` is smaller than `garbage_data + raw_jpeg_header + 2`
-(observed with `dropbox/lepton`'s own `images/gold-legacy.lep`), the first
+For files whose declared `jpeg_file_size` is smaller than
+`garbage_data + raw_jpeg_header + 2` (legacy C++ truncation files), the first
 expression underflows and **panics** in any build with overflow checks
 (debug/dev; tests). Under `panic = "abort"` — SageThumbs' release profile, and
 the mode the shell extension runs in inside explorer/dllhost — that panic
@@ -40,9 +39,13 @@ the repo's `src/lib.rs`).
 
 1. **`structs/lepton_header.rs` — early_eof size arithmetic** (`saturating_sub`
    on `jpeg_file_size - garbage - header - SOI` and the per-segment loop).
-   Debug/overflow-checked builds panicked on legacy C++ files
-   (`dropbox/lepton` `gold-legacy.lep`); release silently wrapped. Clamping to
-   0 preserves the "shorten the last segment" intent and fails cleanly.
+   Debug/overflow-checked builds panicked on legacy C++ truncation files
+   whose declared size doesn't cover header + garbage (reproduced with a
+   crafted EEE+GRB file; note that dropbox's `gold-legacy.lep` itself has NO
+   EEE marker — the crash it actually triggered upstream is fix 2's
+   `num_threads - 1` with an empty HH list). Release silently wrapped.
+   Clamping to 0 preserves the "shorten the last segment" intent and fails
+   cleanly.
 2. **`structs/lepton_header.rs` — zero thread-handoff guard.** `num_threads - 1`
    underflowed (usize) on legacy C++ files with an empty HH list; now a clean
    `BadLeptonFile`.
@@ -107,13 +110,99 @@ the repo's `src/lib.rs`).
     `u32::MAX` now means "no truncation", which is what the value represents
     (real encoders write actual sizes; a wrapped zero would silently empty
     the image).
+12. **`jpeg/jpeg_write.rs` — u8 eob-scan underflow in `encode_ac_prg_sa`.`**
+    The scan walks `bpos: u8` DOWN from `to` while `bpos >= from`. With a
+    hostile SOS declaring Ss=0/Se≥1 (the decode-side header accepts from==0;
+    only the encode side rejects it) and a block with no ±1 coefficient (an
+    all-zero block is a valid hostile decode), the upstream `bpos -= 1`
+    underflowed: overflow panic in debug, and in RELEASE a wrap to 255 that
+    indexed `block[255]` of a `[i16; 64]` — an index-OOB abort in ALL builds
+    on the main thread (process_progressive → jpeg_write_entire_scan, no
+    catch_unwind). The C++ reference uses a signed int and exits at -1;
+    stopping at 0 is the equivalent scan. Regression:
+    `encode_ac_prg_sa_from_zero_all_zero_block_does_not_underflow`
+    (unit-tests the private fn directly — the only deterministic trigger,
+    since a decode-level repro needs a valid progressive bitstream whose SOS
+    was rewritten).
+13. **`jpeg/jpeg_header.rs` — decode-side 4-color (CMYK) gate.** The shared
+    `JpegHeader::parse` accepted up to 4 components (`cmpc > 4`) while the
+    C++ reference rejects 4-color JPEGs at header-parse time
+    (`custom_exit(UNSUPPORTED_4_COLORS)`) and the Rust port only kept that
+    rejection on the ENCODE side (jpeg_read.rs). A hostile 4-component .lep
+    reached `RowSpec::get_row_spec_from_index`'s
+    `image_data.len() <= COLOR_CHANNEL_NUM_BLOCK_TYPES` assert on a decode
+    worker — a panic in ALL builds (release: process abort in the shell
+    host; progressive files hit it on the MAIN thread via
+    jpeg_write_entire_scan with no catch_unwind). The shared parse gate now
+    rejects `cmpc > COLOR_CHANNEL_NUM_BLOCK_TYPES` (3) as `UnsupportedJpeg`;
+    the encode-side check stays as defense in depth. Regression:
+    `tests/hostile_decode.rs::four_component_sof_rejected`.
+14. **`structs/lepton_header.rs` — MCU-row grid alignment for thread ranges**
+    (completes fix 4). Fix 4 validated inversion/contiguity/start-at-0 but
+    not MCU alignment. `RowSpec::get_row_spec_from_index` emits luma_y
+    values that are multiples of `component_multiple[0] = bcv[0]/mcuv`, and
+    each decode thread consumes WHOLE MCU rows; a boundary between two grid
+    points makes the thread's BlockBasedImage capacity (computed from
+    `(end-start)/bcv[0]`) smaller than the blocks the MCU row emits,
+    tripping `append_block`'s capacity assert on a worker — a panic in ALL
+    builds. Legit encoders always split on MCU rows (C++
+    `crystallize_thread_handoff` uses `mcu/mcuh` grid rows). Off-grid
+    boundaries are now `BadLeptonFile`. Regression:
+    `tests/hostile_decode.rs::off_grid_thread_range_rejected`.
+15. **`structs/thread_handoff.rs` — validate `num_overhang_bits`.** The HH
+    marker carries it raw; C++ encoders write 0..=7 (64 - cbit2 with cbit2 in
+    (56, 64]) and 0xff is the C++ legacy-mode marker (unreachable here —
+    legacy files carry no HH marker and are rejected by fix 2 before
+    deserialize). A value > 8 flowed into
+    `BitWriter::reset_from_overhang_byte_and_num_bits`, where `64 - num_bits`
+    underflows (debug panic; release wraps and trips the `has_no_remainder`
+    assert on the decode worker) — an abort in the shell host. deserialize
+    now rejects it as `BadLeptonFile` (its return type is the crate error,
+    not io, so the clean codes work). Regression:
+    `structs::thread_handoff::tests::overhang_bits_validated`.
+16. **`structs/lepton_header.rs` — bound the whole decompressed header**
+    (completes fix 5/10). Three coordinated changes:
+    - The ZlibDecoder is wrapped in `.take(max_jpeg_file_size)` so the TOTAL
+      decompressed stream — every marker's payload together, not just one
+      length field — is bounded. Without this, a deflate bomb (stored blocks
+      expand ~13107x) could grow the recovery-marker section to GiB across
+      many markers, an OOM abort. take() exhaustion surfaces as
+      UnexpectedEof (which the marker loop treats as stream end), so the
+      limit() check after the loop turns "budget hit" into a clean error
+      instead of silently accepting a truncated header.
+    - The CRS `rst_count` cap (fix 10) is now the byte-consistent
+      `max_jpeg_file_size / 4` (it counts u32 ENTRIES; the old per-marker
+      cap alone still allowed a 512 MiB Vec).
+    - The trailing `assert!(remaining == 0)` — reachable on 1-2 trailing
+      bytes after the last marker (the 3-byte prefix read breaks on
+      UnexpectedEof first) — is a clean `BadLeptonFile`, never a panic.
+    Regressions: `tests/hostile_decode.rs::crs_entry_count_capped`,
+    `trailing_bytes_after_markers_clean_error`.
+17. **`jpeg/block_based_image.rs` — merge contiguity assert → clean error.**
+    The upstream `assert!(dpos_offset == contents.len())` in `merge` is a
+    PANIC in ALL builds, reachable on the MAIN thread for progressive files
+    (process_progressive, no catch_unwind) from a hostile EEE truncation:
+    `max_dpos` cutting through a middle thread partition stops that
+    partition short (the decode gate), so the next partition's dpos_offset
+    no longer matches the accumulated contents. The C++ reference has no
+    such assert (its reads clamp dpos to trunc_bc-1), but the Rust JPEG
+    writers index the merged image by the full-height layout, so a short
+    partition cannot be tolerated without a fill pass — a clean error is the
+    safe middle ground. Regression:
+    `jpeg::block_based_image::tests::merge_with_gate_truncated_partition_is_clean_error`
+    (deterministic; an end-to-end trigger is impractical: baseline files
+    never merge, empty tail partitions are dropped by the multiplexer, and
+    the alignment math makes a truncated-but-nonempty partition pair
+    unreachable through hostile EEE values alone).
 
 ## Verification
 
 - `cargo test` (debug): `decode::lepton::tests::*` plus the C++-interop
   samples (dropbox `gold-legacy.lep`, `iphone16.lep`, `narrowrst.lep`) must
   not panic; legacy-format files decode or return `Err`, never abort.
-  Observed: `iphone16.lep` decodes to the full 3264×2448 JPEG;
+  Observed: `iphone16.lep` decodes to the full 3264×2448 JPEG (byte-exact
+  to `iphone.jpg` — see
+  `decode::lepton::tests::cpp_encoded_iphone16_decodes_bit_exact_to_source_jpeg`);
   `gold-legacy.lep` returns `BadLeptonFile` (empty thread handoffs);
   `narrowrst.lep` returns `VersionUnsupported` (lepton version 4 — out of
   this crate's supported version-1 range).
@@ -143,5 +232,8 @@ the repo's `src/lib.rs`).
 Remove this override after upstream ships the fixes (upstream `main` still
 carries the unchecked arithmetic, the ignored parse boolean, the unbounded
 header resizes, the unvalidated thread ranges, the unbounded `rst_cnt` index,
-the unguarded `max_d_pos + 1`, the thread-pool Arc leak, and the send-unwrap —
-and the LepViewer/LepThumb project vendors the same unfixed 0.5.8).
+the uncapped CRS loop, the unguarded `max_d_pos + 1`, the thread-pool Arc
+leak, the send-unwrap, the u8 eob-scan underflow, the missing 4-color gate,
+the missing MCU-grid alignment check, the unvalidated overhang bits, the
+unbounded decompressed header, and the merge-contiguity assert — and the
+LepViewer/LepThumb project vendors the same unfixed 0.5.8).

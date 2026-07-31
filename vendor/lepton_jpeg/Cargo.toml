@@ -42,6 +42,10 @@ name = "lepton_jpeg"
 crate-type = ["lib"]
 path = "src/lib.rs"
 
+[[test]]
+name = "hostile_decode"
+path = "tests/hostile_decode.rs"
+
 [dependencies.bytemuck]
 version = "1"
 
