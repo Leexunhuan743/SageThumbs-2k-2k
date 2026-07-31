@@ -239,8 +239,11 @@ pub fn ocr(input: &str) -> Result<String, String> {
     // bytes would always fail here. Same shared input cap as `thumbnail`, and
     // the buffer is still MOVED onto the OCR worker thread (not held twice).
     let bytes = ocr::decode_to_png(input).map_err(|e| e.to_string())?;
-    // Propagate the REAL error — "no text", "no language pack", and "decode failed" are
-    // three different, actionable situations (especially for an MCP/AI caller parsing this).
+    // Surface the REAL error where the codes allow it: the recognizer's
+    // distinct "image too large" HRESULT is separated from the blanket
+    // failure (which covers no-text, missing language pack, and engine
+    // errors alike — the WinRT path reports all of those as a generic
+    // failure, so they cannot be told apart here).
     ocr::recognize_bytes(bytes).map_err(|e| {
         // "Too large for the recognizer" is a different, actionable answer from "no text /
         // no language pack" — an MCP or AI caller parsing this should be told to downscale,
@@ -248,7 +251,7 @@ pub fn ocr(input: &str) -> Result<String, String> {
         if e.code() == ocr::OCR_IMAGE_TOO_LARGE {
             format!("OCR failed: {e} (the image is larger than the recognizer's maximum dimension)")
         } else {
-            format!("OCR failed: {e} (no text found, or no OCR language pack installed)")
+            format!("OCR failed: {e} (no text found, no OCR language pack installed, or the engine failed)")
         }
     })
 }
