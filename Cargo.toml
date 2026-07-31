@@ -1,6 +1,6 @@
 [workspace]
 members = ["dll"]
-exclude = ["vendor/exr"]
+exclude = ["vendor/exr", "vendor/lepton_jpeg"]
 # Build BOTH the core package (rlib + the two EXEs) AND the cdylib wrapper on a bare
 # `cargo build` — so `cargo build --release` still produces sagethumbs2k.dll + the EXEs.
 # CI + the integration tests rely on the DLL existing.
@@ -18,6 +18,10 @@ resolver = "2"
 # in vendor/exr/SAGETHUMBS-PATCH.md. Remove this override after upstream ships the fix.
 [patch.crates-io]
 exr = { path = "vendor/exr" }
+# lepton_jpeg 0.5.8 vendored + patched: the early_eof size arithmetic underflows
+# (debug panic / potential abort under panic=abort) on legacy C++-encoded .lep files
+# (e.g. dropbox/lepton gold-legacy.lep). See vendor/lepton_jpeg/SAGETHUMBS-PATCH.md.
+lepton_jpeg = { path = "vendor/lepton_jpeg" }
 
 # Shared version for the rlib (`sagethumbs2k`) + the cdylib wrapper (`sagethumbs2k-dll`),
 # build-release.ps1 reads this line; keep it in sync with
@@ -198,8 +202,10 @@ jxl-oxide = { version = "0.12", default-features = false, features = ["image"] }
 # Lepton (.lep) — Dropbox's lossless JPEG recompression (0xCF 0x84 magic). Pure-Rust
 # Apache-2.0 port of dropbox/lepton (microsoft/lepton_jpeg_rust), #![forbid(unsafe_code)],
 # fuzzed; decodes back to a bit-exact JPEG which the `image` tier then decodes. Decode-only
-# in our tree (LTO dead-strips the encoder from the DLL); a per-call thread pool keeps no
-# threads parked in dllhost/explorer. Exact-pinned: security-sensitive decoder.
+# in our tree (LTO dead-strips the encoder from the DLL). Vendored + patched (overflow
+# panics on legacy C++ files + a worker-thread leak in per-call pools — see
+# vendor/lepton_jpeg/SAGETHUMBS-PATCH.md); the per-call thread pool keeps no threads
+# parked in dllhost/explorer. Exact-pinned: security-sensitive decoder.
 lepton_jpeg = "=0.5.8"
 
 [features]

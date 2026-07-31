@@ -173,6 +173,25 @@ jobs:
       - name: DWAA and DWAB roundtrips
         run: cargo test --manifest-path vendor/exr/Cargo.toml --no-default-features --test roundtrip roundtrip_dwa
 
+  # Same arrangement for the vendored lepton_jpeg: excluded from the application
+  # workspace, so its own tests run explicitly. The thread-pool regression tests
+  # must stay green — they guard the per-call-pool no-leak / no-SendError patches
+  # (see vendor/lepton_jpeg/SAGETHUMBS-PATCH.md). WORKSPACE_ROOT satisfies the
+  # crate's compile-time `env!` (only the image-file tests actually read it).
+  vendored-lepton:
+    name: vendored lepton_jpeg (crash-safety patch)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Toolchain
+        run: rustup show
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Lepton thread-pool regression tests
+        env:
+          WORKSPACE_ROOT: ${{ github.workspace }}
+        run: cargo test --manifest-path vendor/lepton_jpeg/Cargo.toml --lib simple_threadpool
+
   # License + advisory + source/ban audit. The whole dependency graph is now
   # 100% permissive (RAR/CBR via the pure-Rust `rars` crate — no proprietary
   # UnRAR anywhere), so this proves the build is license-clean. Config +

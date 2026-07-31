@@ -72,3 +72,7 @@ Thumbs.db
 /mutants.out/
 /mutants.out.old/
 .pi
+# vendored lepton_jpeg builds standalone under `cargo test --manifest-path` (like exr);
+# its generated lockfile is not part of the patch.
+vendor/lepton_jpeg/Cargo.lock
+vendor/lepton_jpeg/target/

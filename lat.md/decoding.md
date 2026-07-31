@@ -30,4 +30,4 @@ Archive listing comes from [[src/container/mod.rs#list_archive]] and OCR from th
 
 Dropbox's lossless JPEG recompression (.lep, 0xCF 0x84 magic) decodes through the pure-Rust `lepton_jpeg` crate (Apache-2.0, `#![forbid(unsafe_code)]`) to a bit-exact JPEG, which the `image` tier then decodes.
 
-Caps come from `EnabledFeatures` (MAX_DIM per edge, 128 MiB JPEG stream, 2 worker threads on a per-call pool that exits with the decode — no threads linger in dllhost). Decode-only: no .lep encode or Convert target.
+Caps come from `EnabledFeatures` (MAX_DIM per edge, 128 MiB JPEG stream, 2 worker threads on a per-call pool that exits with the decode — no threads linger in dllhost). The crate is **vendored + patched** (`vendor/lepton_jpeg/`, see SAGETHUMBS-PATCH.md): nine crash-safety fixes found by an independent audit — legacy-C++ overflow panics, an ignored parse boolean (~30-byte file → Vec OOB in all builds), unbounded header resizes (~4 GiB OOM), a thread leak and SendError race in per-call pools, plus bounds/continuity validation for hostile thread-split headers. Decode-only: no .lep encode or Convert target.
