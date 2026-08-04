@@ -5,11 +5,11 @@
   "referenceInstallerSha256": "e79e1d90385841073866f6642376a3a0be8adb8a86880d25aea6a73cb6d29cec",
   "installerGrowthAllowanceBytes": 131072,
   "maxInstallerBytes": 13249684,
-  "referenceRustPayloadBytes": 22528000,
+  "referenceRustPayloadBytes": 23093760,
   "rustPayloadGrowthAllowanceBytes": 262144,
-  "maxRustPayloadBytes": 22790144,
+  "maxRustPayloadBytes": 23355904,
   "referenceMagickPayloadBytes": 29827612,
   "magickPayloadGrowthAllowanceBytes": 262144,
   "maxMagickPayloadBytes": 30089756,
-  "rationale": "The measured 1.3.6-rc1 reference is the first baseline validated by the current output-signature and clean-machine dependency gates. Tagged 1.3.2-1.3.5 Full installers omitted load-bearing AVIF and JPEG XL writer files and are not valid no-regression baselines. Keep later releases within 128 KiB compressed and 256 KiB for each raw payload unless an explicit reviewed policy change records why. Policy change (reviewed 2026-08-01, dev @ 1.4.2): the Lepton (.lep) decode tier added in 1.4.1 grew the measured raw Rust payload (sagethumbs2k.dll + SageThumbs2K.exe + st2k.exe, same-name check in check-release-size.ps1) from 22,216,192 to 22,528,000 bytes — 49,664 bytes over the old ceiling; the payload is rebuilt from scratch for 1.4.2 and re-measured at 22,528,000, which is now the reference (allowance unchanged at 256 KiB)."
+  "rationale": "The measured 1.3.6-rc1 reference is the first baseline validated by the current output-signature and clean-machine dependency gates. Tagged 1.3.2-1.3.5 Full installers omitted load-bearing AVIF and JPEG XL writer files and are not valid no-regression baselines. Keep later releases within 128 KiB compressed and 256 KiB for each raw payload unless an explicit reviewed policy change records why. Policy change (reviewed 2026-08-01, dev @ 1.4.2): the Lepton (.lep) decode tier added in 1.4.1 grew the raw Rust payload (sagethumbs2k.dll + SageThumbs2K.exe + st2k.exe, same-name check in check-release-size.ps1). The 1.4.2 reference is measured from the FULL feature set exactly as the CI/pipeline builds it (release + LTO + crt-static + --features webp-lossy,html-preview): GitHub Actions windows-latest measured 23,093,760 bytes, local dev machine 23,092,736. The previous 22,528,000 baseline came from a feature-less build and understated the payload by ~565 KiB (303,616 over the old ceiling on CI) — superseded; allowance unchanged at 256 KiB."
 }

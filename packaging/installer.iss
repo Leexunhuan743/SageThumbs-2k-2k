@@ -44,8 +44,10 @@ SolidCompression=yes
 WizardStyle=modern
 ; Rich VERSIONINFO on Setup.exe - a metadata-less installer is heuristic-AV
 ; false-positive bait (same reason the binaries + magick stubs carry it).
-VersionInfoVersion={#AppVer}
-VersionInfoProductVersion={#AppVer}
+; The numeric version comes from the pipeline ({#AppVerNum} strips any -pre
+; suffix from AppVer); the display AppVersion above keeps the full string.
+VersionInfoVersion={#AppVerNum}
+VersionInfoProductVersion={#AppVerNum}
 VersionInfoCompany={#Publisher}
 VersionInfoProductName={#AppName}
 VersionInfoDescription={#AppName} Setup
@@ -114,7 +116,9 @@ Source: "stage\LICENSE*"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoe
 ; exists for exact staged testing but is excluded from this second installer row.
 Source: "stage\policy.xml"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 ; Bundled ImageMagick (magick.exe + DLLs + modules\).
+#ifndef NoMagick
 Source: "stage\magick\*"; DestDir: "{app}"; Excludes: "policy.xml"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: magick
+#endif
 
 [Icons]
 Name: "{group}\SageThumbs 2K"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\app.ico"

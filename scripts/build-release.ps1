@@ -250,7 +250,7 @@ if ($bundleMagick) {
     # raster-decode path. Regenerated from the installed ImageMagick's own exports on every build,
     # so an IM upgrade adapts automatically after the source pin + regression corpus are
     # deliberately updated. We compare the generated stub's export inventory to upstream
-    # before accepting it. See packaging/MAGICK.md.
+    # before accepting it. See docs/MAGICK.md.
     $stubWork = Join-Path $stage 'magick\_stubwork'
     New-Item -ItemType Directory $stubWork -Force | Out-Null
     try {
@@ -428,6 +428,14 @@ $fmtCount = ''
 $fmtLine = & "$targetRel\st2k.exe" formats 2>$null | Select-Object -First 1
 if ($fmtLine -match '^(\d+)\s') { $fmtCount = $Matches[1] }
 $isccArgs = @("/DAppVer=$ver"); if ($fmtCount) { $isccArgs += "/DFmtCount=$fmtCount" }
+# -NoImageMagick must also hide the bundled-magick [Files] row (installer.iss
+# #ifndef NoMagick), or ISCC fails on the absent stage\magick directory.
+if ($NoImageMagick) { $isccArgs += "/DNoMagick" }
+# Setup.exe VERSIONINFO needs a NUMERIC version; strip any -pre release suffix
+# (e.g. "1.4.2-test") so the resource matches the cargo-built binaries' PE
+# version (CARGO_PKG_VERSION, 3 segments) and the release-manifest check.
+$verNum = if ($ver -match '^(\d+\.\d+\.\d+)') { $Matches[1] } else { "0.0.0" }
+$isccArgs += "/DAppVerNum=$verNum"
 $expectedSetupPath = "$root\dist\SageThumbs2K-Setup-$ver.exe"
 # A stale same-version artifact must not survive an odd ISCC "success" and then be
 # mistaken for the installer produced from this stage.
