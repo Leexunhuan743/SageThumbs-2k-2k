@@ -271,7 +271,7 @@ fn test_threadpool() {
     // SAGETHUMBS PATCH (0.5.8): serialize with the pool regression tests so
     // DEFAULT_THREAD_POOL workers (which legitimately outlive their test) do
     // not race the ACTIVE_WORKERS exit assertions.
-    let _lock = POOL_TEST_LOCK.lock().unwrap();
+    let _lock = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let a: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
@@ -306,7 +306,7 @@ fn test_threadpool() {
 fn pool_drop_releases_idle_list() {
     use std::time::{Duration, Instant};
 
-    let _lock = POOL_TEST_LOCK.lock().unwrap();
+    let _lock = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let pool = SimpleThreadPool::new(LeptonThreadPriority::Normal);
     // Direct access to the private field: this test lives in the same module.
     let weak = Arc::downgrade(&pool.idle_threads);
@@ -348,52 +348,52 @@ fn pool_drop_releases_idle_list() {
 fn per_call_pool_workers_exit_on_drop() {
     use std::time::{Duration, Instant};
 
-    let _lock = POOL_TEST_LOCK.lock().unwrap();
+    let _lock = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Only per-call pools feed ACTIVE_WORKERS (see spawn_worker), so the
     // baseline is stable even while other tests execute on DEFAULT_THREAD_POOL.
     let before = ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst);
-    // A per-call pool spawns up to NUM_CPUS workers; on a 1-CPU machine the
-    // second run() reuses the only worker, so assert for min(2, NUM_CPUS).
-    let expected_workers = NUM_CPUS.min(2);
     {
         let pool = SimpleThreadPool::new(LeptonThreadPriority::Normal);
         pool.run(Box::new(|| {}));
         pool.run(Box::new(|| {}));
 
-        // Both workers must come alive...
+        // At least one worker must come alive. We deliberately do NOT assume
+        // two: whether the second run() spawns a second worker or reuses the
+        // first (already parked in the idle list) is scheduling-dependent — on
+        // a 2-vCPU CI runner the first worker parks before the second run(),
+        // so a hard-coded "two workers" assert failed only in the cloud.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) < before + expected_workers
+        while ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) < before + 1
             && Instant::now() < deadline
         {
             thread::yield_now();
         }
         assert!(
-            ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) >= before + expected_workers,
-            "{expected_workers} worker(s) should be alive while the pool is alive"
+            ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) >= before + 1,
+            "at least one worker should be alive while the pool is alive"
         );
 
-        // ...and all must park in the idle list before we drop the pool.
+        // ...and at least one must park in the idle list before we drop the pool.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while pool.get_idle_threads() < expected_workers && Instant::now() < deadline {
+        while pool.get_idle_threads() < 1 && Instant::now() < deadline {
             thread::yield_now();
         }
-        assert!(
-            pool.get_idle_threads() >= expected_workers,
-            "all workers should have parked"
-        );
+        assert!(pool.get_idle_threads() >= 1, "a worker should have parked");
     }
 
     // After the pool is dropped every worker must exit within the 250 ms probe
-    // (2 s budget leaves ample slack on loaded CI machines).
+    // (2 s budget leaves ample slack on loaded CI machines). Assert the count
+    // returns to AT MOST the baseline: another test's pool may still be
+    // tearing down asynchronously (its workers exit too), so exact equality is
+    // fragile; a leak keeps the count ABOVE the baseline and still fails.
     let deadline = Instant::now() + Duration::from_secs(2);
     while ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) > before
         && Instant::now() < deadline
     {
         thread::yield_now();
     }
-    assert_eq!(
-        ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst),
-        before,
+    assert!(
+        ACTIVE_WORKERS.load(std::sync::atomic::Ordering::SeqCst) <= before,
         "every worker spawned for this pool must exit after the pool is dropped"
     );
 }
