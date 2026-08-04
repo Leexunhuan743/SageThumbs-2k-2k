@@ -110,6 +110,7 @@ try {
     # Measured 1.3.6-rc1 size-policy reference. Unlike the tagged 1.3.2-1.3.5
     # packages, it includes the clean-machine AVIF/JXL writers and dependencies.
     # This is a policy reference, not a required digest/byte count for every rebuild.
+    $p = Get-Content $productionPolicy | ConvertFrom-Json
     Set-SparseLength $installer 13118612
     Set-SparseLength (Join-Path $stage 'sagethumbs2k.dll') 6564352
     Set-SparseLength (Join-Path $stage 'SageThumbs2K.exe') 8899072
@@ -121,29 +122,39 @@ try {
 
     # The pre-patch EXR lookup tables duplicated static data in all three Rust
     # artifacts. Keep that raw-payload regression rejected even if compression
-    # happens to hide it in the installer.
-    Set-SparseLength $installer 13118612
-    Set-SparseLength (Join-Path $stage 'sagethumbs2k.dll') 6785024
-    Set-SparseLength (Join-Path $stage 'SageThumbs2K.exe') 9118720
-    Set-SparseLength (Join-Path $stage 'st2k.exe') 6974464
+    # happens to hide it in the installer. The distribution below is the
+    # originally-observed duplicated-table shape; scale it to JUST over the
+    # CURRENT ceiling so the probe stays a regression as the baseline moves
+    # (it used to be hard-coded and went green when maxRustPayloadBytes was
+    # re-baselined).
+    $k = [double]($p.maxRustPayloadBytes + 1) / (6785024 + 9118720 + 6974464)
+    $dll = [int](6785024 * $k)
+    $exe = [int](9118720 * $k)
+    Set-SparseLength (Join-Path $stage 'sagethumbs2k.dll') $dll
+    Set-SparseLength (Join-Path $stage 'SageThumbs2K.exe') $exe
+    Set-SparseLength (Join-Path $stage 'st2k.exe') ($p.maxRustPayloadBytes + 1 - $dll - $exe)
     Assert-Fails 'known duplicated-table Rust payload' {
         & $checker -InstallerPath $installer -PolicyPath $productionPolicy -StagePath $stage
     }
 
     Set-StageTotal $stage 22216192
-    Set-SparseLength $installer 13249685
+    # Ceiling-plus-one probes must track the LIVE policy file — these used to be
+    # hard-coded and silently drifted when maxRustPayloadBytes was re-baselined
+    # (the "production Rust ceiling plus one byte" case went green instead of
+    # failing closed). Read the ceilings from size-budget.json itself.
+    Set-SparseLength $installer ($p.maxInstallerBytes + 1)
     Assert-Fails 'production installer ceiling plus one byte' {
         & $checker -InstallerPath $installer -PolicyPath $productionPolicy -StagePath $stage
     }
 
     Set-SparseLength $installer 13118612
-    Set-StageTotal $stage 22478337
+    Set-StageTotal $stage ($p.maxRustPayloadBytes + 1)
     Assert-Fails 'production Rust ceiling plus one byte' {
         & $checker -InstallerPath $installer -PolicyPath $productionPolicy -StagePath $stage
     }
 
     Set-StageTotal $stage 22216192
-    Set-MagickTotal $stage 30089757
+    Set-MagickTotal $stage ($p.maxMagickPayloadBytes + 1)
     Assert-Fails 'production ImageMagick ceiling plus one byte' {
         & $checker -InstallerPath $installer -PolicyPath $productionPolicy -StagePath $stage
     }
