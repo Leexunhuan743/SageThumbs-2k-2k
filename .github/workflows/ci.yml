@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual dispatch so feature branches (dev, lep-only) can validate in the
+  # cloud before merging (gh workflow run ci.yml --ref <branch>).
+  workflow_dispatch:
 
 # CI only reads the checkout and public dependency metadata.
 permissions:
