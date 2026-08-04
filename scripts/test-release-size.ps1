@@ -110,6 +110,7 @@ try {
     # Measured 1.3.6-rc1 size-policy reference. Unlike the tagged 1.3.2-1.3.5
     # packages, it includes the clean-machine AVIF/JXL writers and dependencies.
     # This is a policy reference, not a required digest/byte count for every rebuild.
+    $p = Get-Content $productionPolicy | ConvertFrom-Json
     Set-SparseLength $installer 13118612
     Set-SparseLength (Join-Path $stage 'sagethumbs2k.dll') 6564352
     Set-SparseLength (Join-Path $stage 'SageThumbs2K.exe') 8899072
@@ -131,19 +132,23 @@ try {
     }
 
     Set-StageTotal $stage 22216192
-    Set-SparseLength $installer 13249685
+    # Ceiling-plus-one probes must track the LIVE policy file — these used to be
+    # hard-coded and silently drifted when maxRustPayloadBytes was re-baselined
+    # (the "production Rust ceiling plus one byte" case went green instead of
+    # failing closed). Read the ceilings from size-budget.json itself.
+    Set-SparseLength $installer ($p.maxInstallerBytes + 1)
     Assert-Fails 'production installer ceiling plus one byte' {
         & $checker -InstallerPath $installer -PolicyPath $productionPolicy -StagePath $stage
     }
 
     Set-SparseLength $installer 13118612
-    Set-StageTotal $stage 22478337
+    Set-StageTotal $stage ($p.maxRustPayloadBytes + 1)
     Assert-Fails 'production Rust ceiling plus one byte' {
         & $checker -InstallerPath $installer -PolicyPath $productionPolicy -StagePath $stage
     }
 
     Set-StageTotal $stage 22216192
-    Set-MagickTotal $stage 30089757
+    Set-MagickTotal $stage ($p.maxMagickPayloadBytes + 1)
     Assert-Fails 'production ImageMagick ceiling plus one byte' {
         & $checker -InstallerPath $installer -PolicyPath $productionPolicy -StagePath $stage
     }
