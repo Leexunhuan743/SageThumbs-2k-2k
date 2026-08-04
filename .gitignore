@@ -79,3 +79,7 @@ vendor/lepton_jpeg/target/
 
 # lat semantic-search vector cache (regenerated locally; do not track)
 lat.md/.cache/vectors.db
+# Agent Lattice knowledge graph + repo guidelines — local working notes, not part of
+# the shipped project (already in history; kept on disk for `lat check`/agent hooks).
+/AGENTS.md
+/lat.md/
