@@ -222,13 +222,12 @@ the repo's `src/lib.rs`).
 19. **`src/helpers.rs` — fixture path resolution.** `read_file` used the
     compile-time `WORKSPACE_ROOT` env (the upstream checkout root); it now
     resolves via `CARGO_MANIFEST_DIR` so the crate builds without any
-    external environment variable. The upstream images/ corpus is NOT
-    vendored (it would add ~63 MiB to the repo); CI runs the fixture-free
-    subset — the full lib suite with the 22 image-file tests skipped by
-    exact name plus `tests/hostile_decode.rs` (previously CI only ran
+    external environment variable. The upstream images/ corpus (28 files,
+    ~63 MiB: android*/iphone*/tiny/hq/slrcity/zeros_in_dqt_tables/pixelated/
+    truncate4/half_scan*/truncbad) is vendored under `images/` so the FULL
+    upstream lib test suite runs in CI (previously CI only ran
     `simple_threadpool` and the hostile tests were orphaned outside every
-    job). A full local run needs the upstream `images/` directory copied to
-    `vendor/lepton_jpeg/images/`.
+    job).
 
 ## Verification
 
@@ -246,11 +245,10 @@ the repo's `src/lib.rs`).
 - `cargo test --release`: same suite, release overflow-checking off — the
   regression this patch prevents would previously have been silent in
   release; the debug-mode panic is the reproducible symptom.
-- `cargo test --manifest-path vendor/lepton_jpeg/Cargo.toml --lib -- --skip <22 image-file tests>`
-  plus `--test hostile_decode`: the fixture-free CI set (skip list in
-  `.github/workflows/ci.yml`). No `WORKSPACE_ROOT` environment variable is
-  required. With the upstream `images/` directory copied to
-  `vendor/lepton_jpeg/images/`, the skip list can be dropped for a full run.
+- `cargo test --manifest-path vendor/lepton_jpeg/Cargo.toml`: the full
+  vendored suite (lib tests + `tests/hostile_decode.rs`). Fixtures live in
+  `vendor/lepton_jpeg/images/` (resolved via `CARGO_MANIFEST_DIR`); no
+  `WORKSPACE_ROOT` environment variable is required.
 - `tests/hostile_decode.rs` (6 tests): the patch 13/14/16 discriminators plus
   three added in the audit follow-up — `zero_thread_handoffs_is_clean_error`
   (patch 2, previously only corpus-covered), `early_eof_segment_loop_is_bounded`

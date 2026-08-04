@@ -181,8 +181,8 @@ jobs:
   # must stay green — they guard the per-call-pool no-leak / no-SendError patches
   # and the hostile-header/block-budget discriminators (see
   # vendor/lepton_jpeg/SAGETHUMBS-PATCH.md). The upstream image-file tests
-  # (roundtrip/corpus — they read images/*.jpg from the upstream checkout,
-  # NOT vendored here) are skipped by exact name so this job is fixture-free.
+  # run against the vendored fixtures under vendor/lepton_jpeg/images/
+  # (resolved via CARGO_MANIFEST_DIR), so the FULL crate suite is exercised.
   vendored-lepton:
     name: vendored lepton_jpeg (hardening patches)
     runs-on: windows-latest
@@ -192,10 +192,8 @@ jobs:
         run: rustup show
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Full vendored lepton_jpeg test suite (fixture-free)
-        run: cargo test --manifest-path vendor/lepton_jpeg/Cargo.toml --lib -- --skip jpeg::jpeg_read::tests::read_garbage_behavior_baseline --skip jpeg::jpeg_read::tests::read_garbage_behavior_progressive --skip jpeg::jpeg_read::tests::test_benchmark_read_jpeg --skip jpeg::jpeg_write::tests::roundtrip_baseline_jpeg --skip jpeg::jpeg_write::tests::roundtrip_progressive_jpeg --skip jpeg::jpeg_write::tests::test_benchmark_write_jpeg --skip structs::lepton_file_reader::tests::parse_and_write_header --skip structs::lepton_file_reader::tests::test_decode_single_threaded --skip structs::lepton_file_reader::tests::test_encode_single_threaded --skip structs::lepton_file_reader::tests::test_pixelated --skip structs::lepton_file_reader::tests::test_simple_parse_baseline --skip structs::lepton_file_reader::tests::test_simple_parse_progressive --skip structs::lepton_file_reader::tests::test_simple_parse_trailing --skip structs::lepton_file_reader::tests::test_streaming_results --skip structs::lepton_file_reader::tests::test_too_small_output --skip structs::lepton_file_reader::tests::test_truncate4 --skip structs::lepton_file_reader::tests::test_truncated_with_bad_garbage_data --skip structs::lepton_file_reader::tests::test_truncated_with_bad_truncation_version --skip structs::lepton_file_reader::tests::test_truncated_with_ok_truncation_version --skip structs::lepton_file_reader::tests::test_zero_dqt --skip structs::lepton_file_writer::tests::test_slrcity --skip structs::lepton_file_writer::tests::test_too_small_output
-      - name: Hostile-header discriminators
-        run: cargo test --manifest-path vendor/lepton_jpeg/Cargo.toml --test hostile_decode
+      - name: Full vendored lepton_jpeg test suite (fixtures vendored)
+        run: cargo test --manifest-path vendor/lepton_jpeg/Cargo.toml
 
   # License + advisory + source/ban audit. The whole dependency graph is now
   # 100% permissive (RAR/CBR via the pure-Rust `rars` crate — no proprietary
