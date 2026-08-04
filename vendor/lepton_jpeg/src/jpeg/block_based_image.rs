@@ -14,6 +14,19 @@ use crate::consts::ZIGZAG_TO_TRANSPOSED;
 
 use super::jpeg_header::JpegHeader;
 
+/// SAGETHUMBS PATCH (0.5.8): global coefficient-block budget mirroring the
+/// C++ reference's default memory limit (jpgcoder.cc:734-752:
+/// mem_limit = 1280 MiB - 128 MiB * (MAX_NUM_THREADS - 1) = 384 MiB with
+/// MAX_NUM_THREADS = 8, then max_number_of_blocks = (mem_limit / 4) * 3 /
+/// (sizeof(uint16_t) * 64) = 2,359,296). The upstream Rust port dropped this
+/// budget: a 16384^2 4:4:4 image needs ~1.5 GiB of coefficient buffers
+/// (3 components x 512 MiB) plus another full copy for progressive merge — a
+/// transient ~3 GiB peak inside dllhost/explorer, far beyond the nominal
+/// per-decode budget. Unlike C++ (which clamps allocations to the budget and
+/// lets decoding proceed), we reject over-budget components up front with a
+/// clean error: the Rust capacity checks cannot tolerate a clamped buffer.
+const MAX_TOTAL_BLOCKS: u64 = ((384u64 * 1024 * 1024) / 4) * 3 / 128;
+
 /// holds the 8x8 blocks for a given component. Since we do multithreaded encoding,
 /// the image may only hold a subset of the components (specified by dpos_offset),
 /// but they can be merged
@@ -40,6 +53,27 @@ impl BlockBasedImage {
         let block_width = jpeg_header.cmp_info[component].bch;
         let original_height = jpeg_header.cmp_info[component].bcv;
         let max_size = block_width * original_height;
+
+        // SAGETHUMBS PATCH (0.5.8): whole-component requirement against the
+        // global block budget (see MAX_TOTAL_BLOCKS). A single component whose
+        // full-height block count exceeds its share is rejected here, before
+        // any allocation — every partition new() sees the same total, so the
+        // first call fails cleanly and progressive merge can never accumulate
+        // more than the budget.
+        let total_blocks: u64 = jpeg_header
+            .cmp_info
+            .iter()
+            .take(usize::from(jpeg_header.cmpc))
+            .map(|c| u64::from(c.bch) * u64::from(c.bcv))
+            .sum();
+        if u64::from(max_size) > MAX_TOTAL_BLOCKS * u64::from(max_size) / total_blocks.max(1) {
+            return err_exit_code(
+                ExitCode::OutOfMemory,
+                format!(
+                    "component {component} requires {max_size} coefficient blocks, exceeding the global budget of {MAX_TOTAL_BLOCKS} (total component blocks {total_blocks})"
+                ),
+            );
+        }
 
         let image_capacity = usize::try_from(
             // SAGETHUMBS PATCH (0.5.8): hostile thread-handoff ranges can invert
@@ -421,5 +455,46 @@ mod tests {
             r.is_err(),
             "merge must reject a gate-truncated partition as a clean error"
         );
+    }
+
+    /// PATCH 18 discriminator (global coefficient-block budget): a hostile
+    /// (or merely huge) 16384^2 4:4:4 header requires 3 x 2048^2 = 12.6M
+    /// blocks, ~5x the C++-equivalent budget of 2,359,296. Upstream Rust
+    /// allocated it anyway (up to ~3 GiB transient peak for progressive
+    /// merge). Patched: a clean OutOfMemory error before any allocation.
+    #[test]
+    fn new_rejects_component_over_global_block_budget() {
+        // 16384x16384 4:4:4 -> 2048x2048 blocks per component.
+        let mut jf = JpegHeader::default();
+        jf.cmpc = 3;
+        for c in 0..3 {
+            jf.cmp_info[c].bch = 2048;
+            jf.cmp_info[c].bcv = 2048;
+            jf.cmp_info[c].bc = 2048 * 2048;
+            jf.cmp_info[c].sfh = 2;
+            jf.cmp_info[c].sfv = 2;
+        }
+        let r = BlockBasedImage::new(&jf, 0, 0, 2048);
+        assert!(
+            r.is_err(),
+            "over-budget component must be rejected before allocation"
+        );
+    }
+
+    /// Positive control: a 4K 4:4:4 image (480x480 blocks per component,
+    /// 691k blocks total) stays well within the budget and allocates.
+    #[test]
+    fn new_accepts_component_within_global_block_budget() {
+        let mut jf = JpegHeader::default();
+        jf.cmpc = 3;
+        for c in 0..3 {
+            jf.cmp_info[c].bch = 480;
+            jf.cmp_info[c].bcv = 480;
+            jf.cmp_info[c].bc = 480 * 480;
+            jf.cmp_info[c].sfh = 2;
+            jf.cmp_info[c].sfv = 2;
+        }
+        let img = BlockBasedImage::new(&jf, 0, 0, 480).unwrap();
+        assert!(img.image.capacity() >= 480 * 480);
     }
 }

@@ -140,7 +140,12 @@ pub fn get_rand_from_seed(seed: [u8; 32]) -> rand_chacha::ChaCha12Rng {
 pub fn read_file(filename: &str, ext: &str) -> Vec<u8> {
     use std::io::Read;
 
-    let filename = std::path::Path::new(env!("WORKSPACE_ROOT"))
+    // SAGETHUMBS PATCH (0.5.8): upstream read from `WORKSPACE_ROOT/images`
+    // (the lepton_jpeg_rust checkout root) via a compile-time env var. In this
+    // vendored tree the fixtures live next to the crate, so resolve relative
+    // to CARGO_MANIFEST_DIR instead — the WORKSPACE_ROOT env is no longer
+    // required to build or test the crate.
+    let filename = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("images")
         .join(filename.to_owned() + ext);
     let mut f = std::fs::File::open(filename).unwrap();

@@ -207,8 +207,23 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
             // EOI before any SOS: the header has no decodable scan.
             0xD9 => return None,
             // SOS: the header is decodable only if a SOF was seen; a lone SOF
-            // (or no SOF at all) means the decode tier rejects the file.
-            0xDA => return sof_dims,
+            // (or no SOF at all) means the decode tier rejects the file. The
+            // decoder also validates the SOS payload (length field, Ns >= 1,
+            // component ids, huffman tables) — mirror the length/Ns checks so
+            // a scan that can never decode reports no dimensions either.
+            0xDA => {
+                let seg_len = u16::from_be_bytes(raw.get(i + 2..i + 4)?.try_into().ok()?);
+                if seg_len < 2 {
+                    return None;
+                }
+                let seg_end = i.checked_add(2)?.checked_add(usize::from(seg_len))?;
+                raw.get(i + 2..seg_end)?; // declared segment must be fully present
+                let ns = raw.get(i + 4).copied().unwrap_or(0);
+                if ns == 0 || ns > 3 {
+                    return None; // decoder rejects zero-component scans; cmpc <= 3
+                }
+                return sof_dims;
+            }
             // A SOF0/1/2 must carry a well-formed payload: precision 8,
             // dimensions within the tier caps, 1..=3 components (the lepton
             // format and the decode tier reject 4-color JPEGs — mirroring the
@@ -256,8 +271,12 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
                 sof_dims = Some((height, width));
                 i = seg_end;
             }
-            // Any other marker carries a length field.
-            _ => {
+            // Any other marker carries a length field. The decoder's
+            // parse_next_segment accepts only DHT/DQT/DRI/APPn/COM here —
+            // SOF3/5-7/9-15, DAC, DNL, DHP, EXP and any unknown marker are
+            // rejected — so a header containing anything else can never
+            // decode; report no dimensions instead of a phantom size.
+            0xC4 | 0xDB | 0xDD | 0xE0..=0xEF | 0xFE => {
                 if seg_len < 2 {
                     return None;
                 }
@@ -265,6 +284,9 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
                 raw.get(i + 2..seg_end)?; // declared segment must be fully present
                 i = seg_end;
             }
+            // Everything else (SOF variants, DAC/DNL/DHP/EXP, reserved and
+            // unknown markers): the decoder rejects it; so do we.
+            _ => return None,
         }
     }
     // Header ended without a scan (or without any SOF): not decodable.
@@ -623,8 +645,8 @@ mod tests {
             hdr.extend_from_slice(&0i16.to_le_bytes()); // last_dc
         }
         hdr.extend_from_slice(&0u16.to_le_bytes()); // padding
-        // GRB: 64 bytes of garbage. 64 (file size) - 64 (garbage) - 92 (header
-        // read) - 2 (SOI) underflows on unpatched code.
+                                                    // GRB: 64 bytes of garbage. 64 (file size) - 64 (garbage) - 92 (header
+                                                    // read) - 2 (SOI) underflows on unpatched code.
         hdr.extend_from_slice(b"GRB");
         hdr.extend_from_slice(&64u32.to_le_bytes());
         hdr.extend_from_slice(&[0; 64]);
@@ -650,17 +672,29 @@ mod tests {
     /// BlockBasedImage::merge's contiguity assert (a panic in ALL builds on the
     /// main thread for progressive files). Both shapes must now be a clean
     /// error before any decode work.
+    ///
+    /// NOTE (audit fix): the previous recipes used starts ABOVE max_luma
+    /// (200, 60, 30 vs max_luma = 12 for the 96x64 fixture) — the upstream
+    /// clamp (`min(start, max_luma)`, executed before this validation)
+    /// flattened those to empty/contiguous ranges, so the unpatched code
+    /// failed on the empty body just like the patched code: the test could
+    /// not discriminate. Starts INSIDE the image that are non-zero or
+    /// decreasing survive the clamp and exercise the real checks.
     #[test]
     fn lepton_thread_ranges_are_validated() {
         let (raw, _) = real_header_parts();
-        // Start beyond the image height (96): inverted by construction.
-        assert!(decode_lepton(&hostile_lep(&hdr_payload(&raw, &hh_marker(200, 0)))).is_err());
-        // Contiguous at first, then a third handoff starting BELOW its
-        // predecessor's start: inverted ranges.
+        // Start 8 (< max_luma 12, != 0): the range survives the clamp and
+        // trips the start-at-0 check. Unpatched: a decode starting at luma
+        // row 8 proceeds (no panic — it simply decodes the tail rows).
+        assert!(decode_lepton(&hostile_lep(&hdr_payload(&raw, &hh_marker(8, 0)))).is_err());
+        // [0,8) then a third handoff starting BELOW its predecessor: [8,4) is
+        // inverted after the clamp (both starts < max_luma). Unpatched: the
+        // inverted range hits the saturated-capacity path and the append
+        // capacity assert on a worker.
         let inverted = [
             &hh_marker(0, 0)[..],
-            &hh_marker(60, 0)[..],
-            &hh_marker(30, 0)[..],
+            &hh_marker(8, 0)[..],
+            &hh_marker(4, 0)[..],
         ]
         .concat();
         assert!(decode_lepton(&hostile_lep(&hdr_payload(&raw, &inverted))).is_err());
@@ -795,8 +829,9 @@ mod tests {
     /// cleanly — never panic. gold-legacy.lep is v1 legacy C++ (panicked before the
     /// vendored decode fix), iphone16.lep is a format-compatible C++ v1 file (the
     /// "16" is its 16 thread handoffs; it carries CRS+FRS restart markers),
-    /// narrowrst.lep is v4 (unsupported by
-    /// `lepton_jpeg` ⇒ must Err).
+    /// narrowrst.lep's version byte is NOT verified (the upstream 0.5.8 sample
+    /// is v1; the C++ checkout cannot produce v4) — this test accepts Ok or
+    /// Err, so the exact version does not affect the outcome.
     #[test]
     fn cpp_corpus_decodes_or_errors_cleanly() {
         let Some(dir) = cpp_corpus_dir() else { return };
@@ -864,12 +899,15 @@ mod tests {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let jpg = std::fs::read(&path).unwrap();
             let Some(lep) = try_lepton_bytes(&jpg) else {
-                // narrowrst.jpg is the one corpus JPEG with in-scan DRI restart
-                // markers; the encoder refuses bit-exact re-encoding of restart
-                // streams (InvalidResetCode in read_first_scan) BY DESIGN — a
-                // capability limitation, not a broken file (the C++ encoder
-                // handles it), and the RST encode/decode path stays
-                // unexercised by roundtrips (see SAGETHUMBS-PATCH.md fix 6).
+                // narrowrst.jpg is the corpus's ODD-restart sample: DRI=15 with
+                // a 255-wide scan, so restart markers fall mid-MCU-row (the
+                // dropbox "odd_rst" test). The encoder refuses bit-exact
+                // re-encoding of such restart streams (InvalidResetCode in
+                // read_first_scan) BY DESIGN — a capability limitation, not a
+                // broken file (the C++ encoder handles it). Note the other
+                // corpus JPEGs (iphone/iphoneprogressive/androidprogressive)
+                // also carry in-scan DRI+RST and roundtrip fine; only the
+                // odd-restart shape is unencodable.
                 let why = if name == "narrowrst.jpg" {
                     "restart-marker JPEG, encoder refuses bit-exact re-encode"
                 } else {
@@ -924,16 +962,19 @@ mod tests {
         );
     }
 
-    /// Bit-exact decode of a C++-ENCODED .lep file, anchored to its source JPEG.
-    /// Every other pixel comparison in the suite goes through the RUST encoder's
-    /// output, so a coordinated regression in the vpx/model/IDCT layer shared by
-    /// encoder and decoder would keep every gate green while C++-encoded files
-    /// misdecode. iphone16.lep is the one C++-v1 file in the corpus that decodes
-    /// (verified: version byte 1, 16 thread handoffs, CRS+FRS markers); its
-    /// source iphone.jpg sits beside it. Orientation is 1 for this pair, so the
-    /// tier's EXIF orientation application is a no-op on both sides.
+    /// Pixel-exact decode of a C++-ENCODED .lep file, anchored to its source
+    /// JPEG. Every other pixel comparison in the suite goes through the RUST
+    /// encoder's output, so a coordinated regression in the vpx/model/IDCT
+    /// layer shared by encoder and decoder would keep every gate green while
+    /// C++-encoded files misdecode. iphone16.lep is the one C++-v1 file in the
+    /// corpus that decodes (verified: version byte 1, 16 thread handoffs,
+    /// CRS+FRS markers); its source iphone.jpg sits beside it. Orientation is
+    /// 1 for this pair, so the tier's EXIF orientation application is a no-op
+    /// on both sides. Scope note: the assertion compares the decoded PIXELS
+    /// (to_rgb8), not the reconstructed JPEG bytes — container-level fidelity
+    /// (APP1/EXIF passthrough, padding) is not covered by this test.
     #[test]
-    fn cpp_encoded_iphone16_decodes_bit_exact_to_source_jpeg() {
+    fn cpp_encoded_iphone16_decodes_pixel_exact_to_source_jpeg() {
         let Some(dir) = cpp_corpus_dir() else { return };
         let lep = std::fs::read(dir.join("iphone16.lep")).unwrap();
         let jpg = std::fs::read(dir.join("iphone.jpg")).unwrap();
@@ -1141,6 +1182,39 @@ mod tests {
         let mut hdr = b"HDR".to_vec();
         hdr.extend_from_slice(&6u32.to_le_bytes());
         hdr.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+        // DAC (0xCC) between SOF and SOS: the decoder rejects it (unknown
+        // marker), so the probe must report no dimensions either.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&20u32.to_le_bytes());
+        hdr.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00, 0xFF,
+            0xCC, 0x00, 0x04, 0x00, 0x00, 0x00,
+        ]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+        // SOF3 (0xC3, lossless): the decoder rejects SOF variants explicitly.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&13u32.to_le_bytes());
+        hdr.extend_from_slice(&[
+            0xFF, 0xC3, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00,
+        ]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+        // SOS declaring Ns = 0 (zero components in scan): the decoder rejects
+        // it ("zero components in scan"), so the probe must not report dims.
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&21u32.to_le_bytes());
+        hdr.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00, 0xFF,
+            0xDA, 0x00, 0x06, 0x00, 0x00, 0x3F, 0x00,
+        ]);
+        assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
+        // SOS with a truncated length field (only the length byte present).
+        let mut hdr = b"HDR".to_vec();
+        hdr.extend_from_slice(&16u32.to_le_bytes());
+        hdr.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00, 0xFF,
+            0xDA, 0x00,
+        ]);
         assert_eq!(probe_dimensions(&hostile_lep(&hdr)), None);
     }
 

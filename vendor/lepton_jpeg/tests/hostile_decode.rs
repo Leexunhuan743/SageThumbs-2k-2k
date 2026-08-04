@@ -217,3 +217,105 @@ fn crs_entry_count_capped() {
         "CRS entry count above the byte budget must be rejected, got {err}"
     );
 }
+
+/// PATCH 2 discriminator (zero thread handoffs): a parseable JPEG header with
+/// no HH marker at all. Upstream `thread_handoff[num_threads - 1]` underflowed
+/// usize::MAX -> index OOB -> PANIC in ALL builds (release: process abort in
+/// the shell host). Patched: BadLeptonFile before any index.
+#[test]
+fn zero_thread_handoffs_is_clean_error() {
+    let raw = raw_header(&sof0_64x64(1), &sos(&[1]));
+    let lep = hostile_lep(&hdr_payload(&raw, &[]));
+    let err = decode_err(&lep);
+    assert_eq!(
+        err.exit_code(),
+        ExitCode::BadLeptonFile,
+        "zero-handoff header must be a clean BadLeptonFile, got {err}"
+    );
+}
+
+/// PATCH 1 discriminator (per-segment `-=` loop): two threads + an EEE marker,
+/// with the FIRST handoff's segment_size exceeding the remaining budget.
+/// Upstream `max_last_segment_size -= segment_size[i]` underflowed u32 in
+/// debug (panic); patched saturating math clamps to 0 and the segment decode
+/// fails cleanly. The single-threaded early_eof tests never iterate the
+/// `0..num_threads-1` loop, so this is the only test reaching that second
+/// underflow site.
+#[test]
+fn early_eof_segment_loop_is_bounded() {
+    let raw = raw_header(&sof0_64x64(1), &sos(&[1]));
+
+    // Two handoffs; first segment_size = u32::MAX (far beyond the budget).
+    let mut hh = Vec::new();
+    hh.extend_from_slice(b"HH");
+    hh.push(2);
+    for (start, size) in [(0u16, u32::MAX), (4u16, 0u32)] {
+        hh.extend_from_slice(&start.to_le_bytes());
+        hh.extend_from_slice(&size.to_le_bytes());
+        hh.push(0); // overhang_byte
+        hh.push(0); // num_overhang_bits
+        for _ in 0..3 {
+            hh.extend_from_slice(&0i16.to_le_bytes()); // last_dc
+        }
+        hh.extend_from_slice(&0u16.to_le_bytes()); // padding
+    }
+
+    // EEE: max_cmp, max_bpos, max_sah, max_dpos[0..4] (read order).
+    let mut eee = Vec::new();
+    eee.extend_from_slice(b"EEE");
+    for _ in 0..3 {
+        eee.extend_from_slice(&0u32.to_le_bytes());
+    }
+    eee.push(0);
+    for _ in 0..4 {
+        eee.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    let mut markers = hh;
+    markers.extend_from_slice(&eee);
+    let lep = hostile_lep(&hdr_payload(&raw, &markers));
+    // Patched: the saturated size (0) makes the first segment read an empty
+    // stream — the VPX reader hits EOF and either produces a zero-pixel
+    // garbage JPEG (Ok, like lepton_eee_maxdpos_saturates) or fails cleanly.
+    // Either way it must NOT panic: upstream plain `-` underflows u32 in
+    // debug and panics at this exact spot (the `0..num_threads-1` loop the
+    // single-threaded early_eof tests never reach). Debug-only discriminator.
+    let mut out = Vec::new();
+    let _ = decode_lepton(
+        &mut Cursor::new(&lep),
+        &mut out,
+        &features(),
+        &SimpleThreadPool::new(LeptonThreadPriority::Normal),
+    );
+}
+
+/// PATCH 16 discriminator (decompressed-stream budget): the hdrs length field
+/// claims exactly the 128 MiB cap and the deflate stream really expands to
+/// that (zeros compress ~1000:1), exhausting the `take(max_jpeg_file_size)`
+/// budget. Upstream (no take) accepted the header and returned Ok on the
+/// empty body; patched: clean "exceeds max_jpeg_file_size" rejection via the
+/// limit()==0 check.
+#[test]
+fn decompressed_header_over_budget_is_clean_error() {
+    let raw = raw_header(&sof0_64x64(1), &sos(&[1]));
+
+    // header payload = HDR + u32 hdrs_len + raw JPEG header + zero fill to the
+    // cap + no recovery markers. hdrs_len is cap-7 so the 3+4-byte prefix and
+    // the hdrs span together exactly fill the take(128 MiB) budget: read_exact
+    // succeeds, then the marker loop hits limit()==0.
+    let cap = 128 * 1024 * 1024usize;
+    let hdrs_len = cap - 7;
+    let mut payload = Vec::with_capacity(3 + 4 + hdrs_len);
+    payload.extend_from_slice(b"HDR");
+    payload.extend_from_slice(&(hdrs_len as u32).to_le_bytes());
+    payload.extend_from_slice(&raw);
+    payload.resize(3 + 4 + hdrs_len, 0);
+
+    let lep = hostile_lep(&payload);
+    let err = decode_err(&lep);
+    assert_eq!(
+        err.exit_code(),
+        ExitCode::BadLeptonFile,
+        "over-budget decompressed header must be rejected, got {err}"
+    );
+}

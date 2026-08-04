@@ -2,8 +2,9 @@
 
 This directory is the crates.io `lepton_jpeg` 0.5.8 package
 (`microsoft/lepton_jpeg_rust` at tag `0.5.8`) plus the upstream `LICENSE.txt`
-and `NOTICE.txt` (Apache-2.0), with seventeen crash-safety fixes (numbered below;
-each changed hunk carries a `SAGETHUMBS PATCH (0.5.8)` marker comment).
+and `NOTICE.txt` (Apache-2.0), with nineteen hardening fixes (crash-safety,
+DoS/memory-budget, and test-infrastructure; numbered below; each changed hunk
+carries a `SAGETHUMBS PATCH (0.5.8)` marker comment).
 
 ## The bug
 
@@ -204,24 +205,61 @@ the repo's `src/lib.rs`).
     never merge, empty tail partitions are dropped by the multiplexer, and
     the alignment math makes a truncated-but-nonempty partition pair
     unreachable through hostile EEE values alone).
+18. **`jpeg/block_based_image.rs` — global coefficient-block budget.** The
+    upstream Rust port dropped the C++ reference's memory budget
+    (`jpgcoder.cc:734-752`: `mem_limit = 1280 MiB - 128 MiB * (MAX_NUM_THREADS
+    - 1) = 384 MiB` with `MAX_NUM_THREADS = 8`, then
+    `max_number_of_blocks = (mem_limit/4) * 3 / 128 = 2,359,296`). A
+    16384^2 4:4:4 image needs ~1.5 GiB of coefficient buffers plus another
+    full copy for progressive merge — a transient ~3 GiB peak inside
+    dllhost/explorer, far beyond the nominal per-decode budget. Unlike C++
+    (which clamps allocations to the budget and lets decoding proceed), the
+    Rust capacity asserts cannot tolerate a clamped buffer, so components
+    whose whole-image block count exceeds their share of the budget are
+    rejected up front with a clean `OutOfMemory` error. Regression:
+    `jpeg::block_based_image::tests::new_rejects_component_over_global_block_budget`
+    (+ positive control `..._within_global_block_budget`).
+19. **`src/helpers.rs` — fixture path resolution.** `read_file` used the
+    compile-time `WORKSPACE_ROOT` env (the upstream checkout root); it now
+    resolves via `CARGO_MANIFEST_DIR` so the crate builds without any
+    external environment variable. The upstream images/ corpus is NOT
+    vendored (it would add ~63 MiB to the repo); CI runs the fixture-free
+    subset — the full lib suite with the 22 image-file tests skipped by
+    exact name plus `tests/hostile_decode.rs` (previously CI only ran
+    `simple_threadpool` and the hostile tests were orphaned outside every
+    job). A full local run needs the upstream `images/` directory copied to
+    `vendor/lepton_jpeg/images/`.
 
 ## Verification
 
 - `cargo test` (debug): `decode::lepton::tests::*` plus the C++-interop
   samples (dropbox `gold-legacy.lep`, `iphone16.lep`, `narrowrst.lep`) must
   not panic; legacy-format files decode or return `Err`, never abort.
-  Observed: `iphone16.lep` decodes to the full 3264×2448 JPEG (byte-exact
+  Observed: `iphone16.lep` decodes to the full 3264×2448 JPEG (pixel-exact
   to `iphone.jpg` — see
-  `decode::lepton::tests::cpp_encoded_iphone16_decodes_bit_exact_to_source_jpeg`);
+  `decode::lepton::tests::cpp_encoded_iphone16_decodes_pixel_exact_to_source_jpeg`;
+  the assertion covers decoded pixels, not the reconstructed JPEG bytes);
   `gold-legacy.lep` returns `BadLeptonFile` (empty thread handoffs);
-  `narrowrst.lep` returns `VersionUnsupported` (lepton version 4 — out of
-  this crate's supported version-1 range).
+  `narrowrst.lep`'s version byte is unverified in this corpus — the upstream
+  0.5.8 sample is version 1, and no C++ build here can produce a v4 file —
+  the corpus test accepts Ok or Err either way.
 - `cargo test --release`: same suite, release overflow-checking off — the
   regression this patch prevents would previously have been silent in
   release; the debug-mode panic is the reproducible symptom.
-- `cargo test --manifest-path vendor/lepton_jpeg/Cargo.toml --lib
-  simple_threadpool` (with `WORKSPACE_ROOT` set to a real directory for the
-  crate's compile-time `env!`): the pool regression tests.
+- `cargo test --manifest-path vendor/lepton_jpeg/Cargo.toml --lib -- --skip <22 image-file tests>`
+  plus `--test hostile_decode`: the fixture-free CI set (skip list in
+  `.github/workflows/ci.yml`). No `WORKSPACE_ROOT` environment variable is
+  required. With the upstream `images/` directory copied to
+  `vendor/lepton_jpeg/images/`, the skip list can be dropped for a full run.
+- `tests/hostile_decode.rs` (6 tests): the patch 13/14/16 discriminators plus
+  three added in the audit follow-up — `zero_thread_handoffs_is_clean_error`
+  (patch 2, previously only corpus-covered), `early_eof_segment_loop_is_bounded`
+  (patch 1's per-segment `-=` loop, previously unreachable: the single-threaded
+  early_eof tests never iterate `0..num_threads-1`; debug-only discriminator —
+  release wraps rather than panics), and
+  `decompressed_header_over_budget_is_clean_error` (patch 16's take-budget
+  `limit()==0` branch, previously untested — a zlib stream that genuinely
+  expands to the 128 MiB cap).
 - `decode::lepton::tests::lepton_mutations_never_panic`: 400 deterministic
   bit-flip/truncation mutations + an oversized-declared-size file must never
   panic, only Ok/Err.
@@ -235,9 +273,12 @@ the repo's `src/lib.rs`).
   normally.
 - Patch 6 (bounded `rst_cnt`) has no deterministic in-repo trigger: reaching
   the recode-time index needs a restart-carrying (DRI) v1 file whose scan
-  data still decodes, and the corpus contains no such sample (narrowrst.lep
-  is version 4). The mutation fuzz patrols the surrounding space; revisit
-  when a restart-carrying v1 sample lands in the corpus.
+  data still decodes AND whose CRS table is shorter than its scan count —
+  no corpus sample has the short-table shape (the corpus's restart-carrying
+  JPEGs — iphone/iphoneprogressive/androidprogressive — all roundtrip
+  cleanly, and narrowrst's odd-restart shape is unencodable here). The
+  mutation fuzz patrols the surrounding space; revisit when a short-CRS
+  sample lands in the corpus.
 
 Remove this override after upstream ships the fixes (upstream `main` still
 carries the unchecked arithmetic, the ignored parse boolean, the unbounded
